@@ -1,0 +1,9 @@
+paho-mqtt==1.6.1
+psycopg2-binary==2.9.6
+python-decouple==3.8
+fastapi==0.103.0
+uvicorn==0.23.2
+dash==2.17.1
+plotly==5.22.0
+requests==2.31.0
+paho-mqtt==1.6.1

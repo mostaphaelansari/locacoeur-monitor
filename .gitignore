@@ -5,7 +5,13 @@ __pycache__/
 
 # C extensions
 *.so
-
+*.crt
+*.key
+certs/
+logs/
+.env
+*.pyc
+__pycache__/
 # Distribution / packaging
 .Python
 build/
