@@ -1878,26 +1878,48 @@ class MQTTService:
         """MQTT log callback (unchanged)"""
         logger.debug(f"MQTT log: {buf}")
 
-    def connect_with_retry(self, max_retries=10, retry_delay=10, max_total_attempts=50):
-        """Connect to MQTT broker with retry logic (unchanged)"""
+    def connect_with_retry(self, max_retries=5, retry_delay=5, max_total_attempts=25):
+        """Connect to MQTT broker with improved retry logic"""
         total_attempts = 0
+        
         while self.running and total_attempts < max_total_attempts:
             for attempt in range(max_retries):
+                total_attempts += 1
                 try:
-                    logger.info(f"Attempting to connect to MQTT broker (attempt {attempt + 1}/{max_retries})")
+                    logger.info(f"Attempting to connect to MQTT broker at {MQTT_BROKER}:{MQTT_PORT} (attempt {attempt + 1}/{max_retries}, total: {total_attempts})")
+                    
+                    # Set a connection timeout
                     self.client.connect(MQTT_BROKER, MQTT_PORT, keepalive=60)
-                    return True
+                    
+                    # Wait a bit for the connection callback
+                    time.sleep(2)
+                    
+                    if self.client.is_connected():
+                        logger.info("MQTT connection established successfully")
+                        return True
+                    else:
+                        logger.warning("Connection attempt did not result in connected state")
+                        
                 except Exception as e:
-                    total_attempts += 1
                     logger.error(f"MQTT connection attempt {attempt + 1} failed: {e}")
                     if total_attempts >= max_total_attempts:
                         logger.error("Max total attempts reached")
-                        self.send_alert_email("MQTT Connection Failed", "Max total connection attempts reached", "critical")
+                        self.send_alert_email(
+                            "MQTT Connection Failed", 
+                            "Max total connection attempts reached", 
+                            "critical"
+                        )
                         return False
+                        
                     if attempt < max_retries - 1:
+                        logger.info(f"Waiting {retry_delay} seconds before next attempt...")
                         time.sleep(retry_delay)
-                        retry_delay = min(retry_delay * 1.5, 60)
-            time.sleep(30)
+                        retry_delay = min(retry_delay * 1.2, 30)  # Exponential backoff with max 30s
+            
+            if total_attempts < max_total_attempts:
+                logger.info("Waiting 30 seconds before next retry cycle...")
+                time.sleep(30)
+        
         return False
 
     def setup_mqtt_client(self):
@@ -1924,54 +1946,100 @@ class MQTTService:
 
 
     def run(self):
-        """Run the MQTT service (unchanged)"""
+        """Run the MQTT service with improved connection handling"""
         logger.info("Starting LOCACOEUR MQTT service...")
         threading.Timer(86400, self.backup_device_data).start()
+        
         connected = False
         while self.running and not connected:
             connected = self.connect_with_retry()
             if not connected:
                 logger.error("Failed to connect to MQTT broker. Retrying in 30 seconds...")
                 time.sleep(30)
+        
         if not connected:
             logger.error("Failed to connect to MQTT broker after all retries")
             return False
+        
         try:
             self.client.loop_start()
+            logger.info("MQTT client loop started successfully")
+            
             while self.running:
                 try:
+                    # Check connection status every 5 seconds instead of every second
                     if not self.client.is_connected():
                         logger.warning("MQTT connection lost, attempting to reconnect...")
                         try:
                             self.client.loop_stop()
+                            logger.debug("MQTT loop stopped")
                         except Exception as e:
                             logger.warning(f"Error stopping MQTT loop: {e}")
+                        
+                        # Reset connection flag and try to reconnect
                         connected = False
-                        while self.running and not connected:
-                            connected = self.connect_with_retry()
-                            if not connected:
-                                time.sleep(30)
-                        if connected:
+                        reconnect_attempts = 0
+                        max_reconnect_attempts = 5
+                        
+                        while self.running and not connected and reconnect_attempts < max_reconnect_attempts:
+                            reconnect_attempts += 1
+                            logger.info(f"Reconnection attempt {reconnect_attempts}/{max_reconnect_attempts}")
+                            
                             try:
-                                self.client.loop_start()
+                                # Create a new client instance to avoid state issues
+                                self.setup_mqtt_client()
+                                connected = self.connect_with_retry(max_retries=3, retry_delay=5)
+                                
+                                if connected:
+                                    logger.info("Successfully reconnected to MQTT broker")
+                                    try:
+                                        self.client.loop_start()
+                                        logger.debug("MQTT loop restarted after reconnection")
+                                    except Exception as e:
+                                        logger.error(f"Error restarting MQTT loop: {e}")
+                                        connected = False
+                                else:
+                                    logger.warning(f"Reconnection attempt {reconnect_attempts} failed")
+                                    if reconnect_attempts < max_reconnect_attempts:
+                                        time.sleep(10)  # Wait before next attempt
                             except Exception as e:
-                                logger.error(f"Error restarting MQTT loop: {e}")
+                                logger.error(f"Error during reconnection attempt {reconnect_attempts}: {e}")
+                                time.sleep(10)
+                        
+                        if not connected:
+                            logger.error("Failed to reconnect after maximum attempts")
+                            self.send_alert_email(
+                                "MQTT Connection Failed", 
+                                "Failed to reconnect to MQTT broker after multiple attempts", 
+                                "critical"
+                            )
+                            break
+                            
                 except Exception as e:
                     logger.error(f"Error checking MQTT connection: {e}")
-                time.sleep(1)
+                
+                # Sleep for 5 seconds instead of 1 to reduce CPU usage
+                time.sleep(5)
+                
         except Exception as e:
             logger.error(f"Main loop crashed: {e}")
             self.send_alert_email("Main Loop Crashed", f"Main loop crashed with error: {e}", "critical")
         finally:
+            logger.info("Shutting down MQTT service...")
             try:
-                self.client.loop_stop()
-                self.client.disconnect()
+                if hasattr(self, 'client') and self.client:
+                    self.client.loop_stop()
+                    self.client.disconnect()
+                    logger.debug("MQTT client disconnected and loop stopped")
             except Exception as e:
                 logger.warning(f"Error during final MQTT cleanup: {e}")
             try:
-                self.db_pool.closeall()
+                if hasattr(self, 'db_pool') and self.db_pool:
+                    self.db_pool.closeall()
+                    logger.debug("Database pool closed")
             except Exception as e:
                 logger.warning(f"Error closing database pool: {e}")
+        
         logger.info("LOCACOEUR MQTT service stopped")
         return True
 
