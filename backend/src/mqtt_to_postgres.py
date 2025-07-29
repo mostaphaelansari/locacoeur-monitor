@@ -1,38 +1,39 @@
-import paho.mqtt.client as mqtt
-import json
-import uuid
-import psycopg2
-from psycopg2 import pool
-import ssl
-import smtplib
-import signal
-import threading
 import sys
 import time
+import uuid
+import ssl
+import signal
+import json
+import hashlib
+import logging
+import threading
+import smtplib
+from typing import Dict, Any, Optional
 from datetime import datetime, timezone, timedelta
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.utils import formatdate
-import logging
-import threading
-from typing import Dict, Any, Optional
+
+import paho.mqtt.client as mqtt
+import psycopg2
+from psycopg2 import errors
+from psycopg2 import pool
 from decouple import config
 from cachetools import TTLCache
-
+from collections import deque
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('mqtt_client.log'),
+        logging.FileHandler('/opt/locacoeur-monitor/backend/logs/mqtt_client.log'),
         logging.StreamHandler()
     ]
 )
 logger = logging.getLogger(__name__)
 
-# Timestamp debug logger
 timestamp_logger = logging.getLogger('timestamp_debug')
-timestamp_handler = logging.FileHandler('timestamp_debug.log')
+timestamp_handler = logging.FileHandler('/opt/locacoeur-monitor/backend/logs/timestamp_debug.log')
 timestamp_handler.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))
 timestamp_logger.addHandler(timestamp_handler)
 timestamp_logger.setLevel(logging.DEBUG)
@@ -73,18 +74,21 @@ class MQTTService:
         self.running = True
         self.reconnect_count = 0
         self.last_connection_time = None
-        self.email_cache = TTLCache(maxsize=100, ttl=3600)  # 1-hour email rate limit
-        self.alert_cache = TTLCache(maxsize=100, ttl=60)    # 60s for alert follow-ups
+        self.email_cache = TTLCache(maxsize=100, ttl=3600)
+        self.alert_cache = TTLCache(maxsize=100, ttl=60)
         self.db_pool = psycopg2.pool.SimpleConnectionPool(1, 20, **DB_CONFIG)
+        self.command_lock = threading.Lock()
+        self.command_cache = {}
+        self.message_lock = threading.Lock()  # Fix for message_lock AttributeError
+        self.processed_messages = deque(maxlen=1000)  # Use deque for FIFO eviction
+        self.client = None
         self.setup_signal_handlers()
         self.initialize_db()
         self.setup_mqtt_client()
-        self.command_cache = TTLCache(maxsize=1000, ttl=3600)  # Store commands for 1 hour
-        self.command_lock = threading.Lock()  # Thread-safe access to command_cache
         self.start_followup_checker()
 
     def setup_signal_handlers(self):
-        """Setup signal handlers for graceful shutdown"""
+        """Setup signal handlers for graceful shutdown (unchanged)"""
         signal.signal(signal.SIGINT, self.signal_handler)
         signal.signal(signal.SIGTERM, self.signal_handler)
 
@@ -104,7 +108,7 @@ class MQTTService:
         sys.exit(0)
 
     def connect_db(self) -> Optional[psycopg2.extensions.connection]:
-        """Get a database connection from the pool"""
+        """Get a database connection from the pool (unchanged)"""
         try:
             return self.db_pool.getconn()
         except Exception as e:
@@ -113,7 +117,7 @@ class MQTTService:
             return None
 
     def release_db(self, conn):
-        """Release a database connection back to the pool"""
+        """Release a database connection back to the pool (unchanged)"""
         try:
             self.db_pool.putconn(conn)
         except Exception as e:
@@ -179,7 +183,7 @@ class MQTTService:
             self.release_db(conn)
 
     def initialize_db(self):
-        """Initialize database schema"""
+        """Initialize database schema with device_data_backup"""
         conn = self.connect_db()
         if not conn:
             return
@@ -193,13 +197,13 @@ class MQTTService:
                     UNIQUE (environment)
                 );
                 CREATE TABLE IF NOT EXISTS Devices (
-                    serial VARCHAR(50) PRIMARY KEY,
+                    device_serial VARCHAR(50) PRIMARY KEY,
                     mqtt_broker_url VARCHAR(255),
                     created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT CURRENT_TIMESTAMP
                 );
                 CREATE TABLE IF NOT EXISTS Commands (
                     command_id SERIAL PRIMARY KEY,
-                    device_serial VARCHAR(50) REFERENCES Devices(serial) ON DELETE CASCADE,
+                    device_serial VARCHAR(50) REFERENCES Devices(device_serial) ON DELETE CASCADE,
                     server_id INTEGER REFERENCES Servers(server_id) ON DELETE RESTRICT,
                     operation_id VARCHAR(50),
                     topic VARCHAR(255),
@@ -211,7 +215,7 @@ class MQTTService:
                 CREATE TABLE IF NOT EXISTS Results (
                     result_id SERIAL PRIMARY KEY,
                     command_id INTEGER REFERENCES Commands(command_id) ON DELETE SET NULL,
-                    device_serial VARCHAR(50) REFERENCES Devices(serial) ON DELETE CASCADE,
+                    device_serial VARCHAR(50) REFERENCES Devices(device_serial) ON DELETE CASCADE,
                     topic VARCHAR(255),
                     result_status VARCHAR(50),
                     result_message TEXT,
@@ -220,7 +224,7 @@ class MQTTService:
                 );
                 CREATE TABLE IF NOT EXISTS Events (
                     event_id SERIAL PRIMARY KEY,
-                    device_serial VARCHAR(50) REFERENCES Devices(serial) ON DELETE CASCADE,
+                    device_serial VARCHAR(50) REFERENCES Devices(device_serial) ON DELETE CASCADE,
                     server_id INTEGER REFERENCES Servers(server_id) ON DELETE RESTRICT,
                     operation_id VARCHAR(50),
                     topic VARCHAR(255),
@@ -233,7 +237,7 @@ class MQTTService:
                 );
                 CREATE TABLE IF NOT EXISTS LEDs (
                     led_id SERIAL PRIMARY KEY,
-                    device_serial VARCHAR(50) REFERENCES Devices(serial) ON DELETE CASCADE,
+                    device_serial VARCHAR(50) REFERENCES Devices(device_serial) ON DELETE CASCADE,
                     led_type VARCHAR(50) NOT NULL,
                     status VARCHAR(50) NOT NULL,
                     description TEXT,
@@ -243,7 +247,7 @@ class MQTTService:
                 );
                 CREATE TABLE IF NOT EXISTS device_data (
                     id SERIAL PRIMARY KEY,
-                    device_serial VARCHAR(50) REFERENCES Devices(serial) ON DELETE CASCADE,
+                    device_serial VARCHAR(50) REFERENCES Devices(device_serial) ON DELETE CASCADE,
                     topic VARCHAR(255),
                     battery INTEGER CHECK (battery >= 0 AND battery <= 100),
                     connection VARCHAR(50),
@@ -264,6 +268,42 @@ class MQTTService:
                     alert_message VARCHAR(255),
                     original_timestamp BIGINT
                 );
+                CREATE TABLE IF NOT EXISTS device_data_backup (
+                    LIKE device_data INCLUDING ALL,
+                    backup_date TIMESTAMP WITHOUT TIME ZONE DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE INDEX IF NOT EXISTS idx_device_data_backup_serial ON device_data_backup(device_serial);
+                CREATE INDEX IF NOT EXISTS idx_device_data_backup_received_at ON device_data_backup(received_at);
+                -- New tables for insert_data
+                CREATE TABLE IF NOT EXISTS Locations (
+                    id SERIAL PRIMARY KEY,
+                    device_serial VARCHAR(50) REFERENCES Devices(device_serial) ON DELETE CASCADE,
+                    timestamp BIGINT,
+                    latitude DOUBLE PRECISION CHECK (latitude BETWEEN -90 AND 90),
+                    longitude DOUBLE PRECISION CHECK (longitude BETWEEN -180 AND 180),
+                    UNIQUE (device_serial, timestamp)
+                );
+                CREATE TABLE IF NOT EXISTS Versions (
+                    id SERIAL PRIMARY KEY,
+                    device_serial VARCHAR(50) REFERENCES Devices(device_serial) ON DELETE CASCADE,
+                    timestamp BIGINT,
+                    version VARCHAR(50),
+                    UNIQUE (device_serial, timestamp)
+                );
+                CREATE TABLE IF NOT EXISTS Status (
+                    id SERIAL PRIMARY KEY,
+                    device_serial VARCHAR(50) REFERENCES Devices(device_serial) ON DELETE CASCADE,
+                    timestamp BIGINT,
+                    state VARCHAR(50),
+                    UNIQUE (device_serial, timestamp)
+                );
+                CREATE TABLE IF NOT EXISTS Alerts (
+                    id SERIAL PRIMARY KEY,
+                    device_serial VARCHAR(50) REFERENCES Devices(device_serial) ON DELETE CASCADE,
+                    timestamp BIGINT,
+                    code VARCHAR(50),
+                    UNIQUE (device_serial, timestamp, code)
+                );
             """)
             conn.commit()
             logger.info("Database schema initialized")
@@ -273,6 +313,8 @@ class MQTTService:
         finally:
             cur.close()
             self.release_db(conn)
+
+
     def start_followup_checker(self):
         """Start a background thread to check for missing command results."""
         def check_missing_results():
@@ -294,14 +336,17 @@ class MQTTService:
     def check_command_timeouts(self):
         """Check for commands that haven't received results within 5 minutes."""
         with self.command_lock:
+            logger.debug(f"Checking command cache: {list(self.command_cache.items())}")
             expired_commands = []
             current_time = datetime.now(timezone.utc)
             for (device_serial, op_id), (topic, sent_time) in list(self.command_cache.items()):
                 if current_time - sent_time > timedelta(minutes=5):
                     expired_commands.append((device_serial, op_id, topic, sent_time))
                     del self.command_cache[(device_serial, op_id)]
+            logger.debug(f"Expired commands: {expired_commands}")
 
         if not expired_commands:
+            logger.debug("No expired commands found")
             return
 
         conn = self.connect_db()
@@ -352,7 +397,7 @@ class MQTTService:
                 INSERT INTO device_data_backup
                 SELECT *, CURRENT_TIMESTAMP FROM device_data WHERE received_at < %s
             """, (datetime.now(timezone.utc) - timedelta(days=30),))
-            cur.execute("DELETE FROM device_data WHERE received_at < %s", 
+            cur.execute("DELETE FROM device_data WHERE received_at < %s",
                     (datetime.now(timezone.utc) - timedelta(days=30),))
             conn.commit()
             logger.info("Backed up and cleaned old device_data")
@@ -364,17 +409,15 @@ class MQTTService:
             self.release_db(conn)
 
     def send_alert_email(self, subject: str, message: str, priority: str = "normal"):
-        """Send email alert with rate limiting"""
+        """Send email alert with rate limiting (unchanged)"""
         if not EMAIL_CONFIG["enabled"]:
             logger.debug(f"Email alerts disabled. Would send: {subject}")
             return
-        
         cache_key = f"{subject}:{priority}:{message[:50]}"
         if cache_key in self.email_cache:
             logger.debug(f"Email suppressed for {subject} (rate limit)")
             return
         self.email_cache[cache_key] = True
-
         max_retries = 3
         for attempt in range(max_retries):
             try:
@@ -383,7 +426,6 @@ class MQTTService:
                 msg['To'] = ", ".join(EMAIL_CONFIG["to_emails"])
                 msg['Date'] = formatdate(localtime=True)
                 msg['Subject'] = f"[LOCACOEUR-{priority.upper()}] {subject}"
-                
                 body = f"""
                 LOCACOEUR MQTT Client Alert
                 Time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}
@@ -395,15 +437,12 @@ class MQTTService:
                 Last connection: {self.last_connection_time}
                 This is an automated message from the LOCACOEUR MQTT monitoring system.
                 """
-                
                 msg.attach(MIMEText(body, 'plain'))
-                
                 server = smtplib.SMTP(EMAIL_CONFIG["smtp_server"], EMAIL_CONFIG["smtp_port"])
                 server.starttls()
                 server.login(EMAIL_CONFIG["username"], EMAIL_CONFIG["password"])
                 server.send_message(msg)
                 server.quit()
-                
                 logger.info(f"Alert email sent successfully: {subject}")
                 return
             except Exception as e:
@@ -508,13 +547,14 @@ class MQTTService:
             logger.debug(f"No critical alerts detected for device {device_serial} on topic {topic}")
 
     def request_firmware_version(self, device_serial: str) -> None:
-        """Send a firmware version request to the specified device."""
         try:
             op_id = str(uuid.uuid4())
             topic = f"LC1/{device_serial}/command/version"
             payload = {"opId": op_id}
             self.client.publish(topic, json.dumps(payload), qos=0)
             logger.info(f"Sent firmware version request to {topic} with opId {op_id}")
+            with self.command_lock:
+                self.command_cache[(device_serial, op_id)] = (topic, datetime.now(timezone.utc))
         except Exception as e:
             logger.error(f"Failed to send version request for {device_serial}: {e}")
             self.send_alert_email(
@@ -567,6 +607,14 @@ class MQTTService:
                     "critical"
                 )
                 return
+            cur.execute(
+                """
+                INSERT INTO Devices (serial, mqtt_broker_url)
+                VALUES (%s, %s)
+                ON CONFLICT (serial) DO NOTHING
+                """,
+                (device_serial[:50], "mqtts://mqtt.locacoeur.com:8883")
+            )
             operation_id = topic.split("/")[-1]
             message_id = data.get("message_id", str(uuid.uuid4()))
             cur.execute(
@@ -590,7 +638,6 @@ class MQTTService:
             )
             conn.commit()
             logger.info(f"Inserted command for device {device_serial} on topic {topic}")
-            # Add command to cache for timeout tracking
             with self.command_lock:
                 self.command_cache[(device_serial, data["opId"])] = (topic, datetime.now(timezone.utc))
         except Exception as e:
@@ -604,7 +651,6 @@ class MQTTService:
         finally:
             cur.close()
             self.release_db(conn)
-
 
     def insert_device_data(self, device_serial: str, topic: str, data: Dict[str, Any]) -> None:
         """Insert device data into the device_data table"""
@@ -708,10 +754,6 @@ class MQTTService:
                             "warning"
                         )
                         return
-                logger.debug(f"Inserting into device_data for {device_serial}: battery={battery}, "
-                            f"led_power={led_power}, led_defibrillator={led_defibrillator}, "
-                            f"led_monitoring={led_monitoring}, led_assistance={led_assistance}, "
-                            f"led_mqtt={led_mqtt}, led_environmental={led_environmental}")
                 cur.execute(
                     """
                     INSERT INTO device_data (
@@ -747,7 +789,7 @@ class MQTTService:
                 ]
                 for led_type, status in led_values:
                     if status is not None:
-                        logger.debug(f"Preparing LED insert: device={device_serial}, type={led_type}, status={status}")
+                        logger.debug(f"Inserting LED: device={device_serial}, type={led_type}, status={status}")
                         cur.execute(
                             """
                             INSERT INTO LEDs (device_serial, led_type, status, description, last_updated)
@@ -757,7 +799,9 @@ class MQTTService:
                             """,
                             (device_serial[:50], led_type, status, None, datetime.now())
                         )
-                        logger.debug(f"Inserted LED: device={device_serial}, type={led_type}, status={status}")
+                        logger.info(f"Inserted into LEDs for device {device_serial}: type={led_type}, status={status}")
+                    else:
+                        logger.warning(f"Missing LED value for {led_type} on device {device_serial}")
                 if battery is not None and battery < 20:
                     self.send_alert_email(
                         "Low Battery",
@@ -980,7 +1024,7 @@ class MQTTService:
         try:
             cur = conn.cursor()
             payload_str = json.dumps(data, sort_keys=True)
-            result_status = str(data.get("result", ""))[:50]  # Store as string to handle integer codes
+            result_status = str(data.get("result", ""))[:50]
             result_message = data.get("message", "")
             timestamp = self.parse_timestamp(data.get("timestamp"), device_serial)
             if timestamp is None:
@@ -1038,7 +1082,12 @@ class MQTTService:
                 )
             )
             conn.commit()
-            if command_id and "update" in topic.lower() or (result_message and "update" in result_message.lower()):
+            logger.info(f"Inserted result for device {device_serial} on topic {topic}")
+            with self.command_lock:
+                if (device_serial, data["opId"]) in self.command_cache:
+                    logger.debug(f"Removed command opId {data['opId']} for {device_serial} from cache after receiving result")
+                    del self.command_cache[(device_serial, data["opId"])]
+            if command_id and ("update" in topic.lower() or (result_message and "update" in result_message.lower())):
                 result_codes = {
                     "0": "Success",
                     "-1": "Missing opId",
@@ -1065,218 +1114,296 @@ class MQTTService:
             cur.close()
             self.release_db(conn)
 
-    def insert_data(self, device_serial: str, topic: str, data: Dict[str, Any]) -> None:
-        """Insert data into the database based on MQTT topic"""
+    def insert_data(self, topic: str, payload: Dict[str, Any]):
+        """Insert data into database with granular UniqueViolation handling"""
         conn = self.connect_db()
         if not conn:
+            logger.error("Failed to connect to database")
             return
+        cur = conn.cursor()
         try:
-            cur = conn.cursor()
-            parsed_timestamp = self.parse_timestamp(data.get("timestamp"), device_serial)
-            topic_parts = topic.split("/")
-            topic_category = topic_parts[2] if len(topic_parts) > 2 else None
-            operation_id = topic_parts[3] if len(topic_parts) > 3 else None
-            payload_str = json.dumps(data, sort_keys=True)
+            device_serial = payload.get("device_serial")
+            event = payload.get("event")
+            timestamp = payload.get("timestamp")
 
-            if topic_category == "event":
-                if operation_id == "location" and not all(key in data for key in ["latitude", "longitude"]):
-                    logger.error(f"Invalid location payload for {device_serial}: {data}")
-                    self.send_alert_email(
-                        "Invalid Payload",
-                        f"Location event missing latitude/longitude for {device_serial}: {data}",
-                        "warning"
-                    )
-                    return
-                elif operation_id == "version" and "version" not in data:
-                    logger.error(f"Invalid version payload for {device_serial}: {data}")
-                    self.send_alert_email(
-                        "Invalid Payload",
-                        f"Version event missing version for {device_serial}: {data}",
-                        "warning"
-                    )
-                    return
-                elif operation_id == "status" and not any(key in data for key in ["led_power", "led_defibrillator", "led_monitoring", "led_assistance", "led_mqtt", "led_environmental"]):
-                    logger.error(f"Invalid status payload for {device_serial}: {data}")
-                    self.send_alert_email(
-                        "Invalid Payload",
-                        f"Status event missing LED data for {device_serial}: {data}",
-                        "warning"
-                    )
-                    return
-                elif operation_id == "alert" and "message" not in data:
-                    logger.error(f"Invalid alert payload for {device_serial}: {data}")
-                    self.send_alert_email(
-                        "Invalid Payload",
-                        f"Alert event missing message for {device_serial}: {data}",
-                        "warning"
-                    )
-                    return
-                if operation_id == "config":
-                    self.insert_config_data(device_serial, topic, payload)
+            if not all([device_serial, event, timestamp]):
+                logger.warning(f"Missing fields in payload: {payload}")
+                return
 
-            if topic_category == "event" and operation_id in ["status", "location"]:
-                if device_serial in self.alert_cache:
-                    logger.info(f"Processing follow-up {operation_id} for alert on {device_serial}")
-                    alert_data = self.alert_cache[device_serial]
-                    self.send_alert_email(
-                        f"Alert Follow-Up - Device {device_serial}",
-                        f"Received {operation_id} event following alert: {json.dumps(alert_data, indent=2)}\nCurrent: {json.dumps(data, indent=2)}",
-                        "warning"
-                    )
+            event_type = event.get("type")
+            if not event_type:
+                logger.warning(f"Missing event type in payload: {payload}")
+                return
 
-            cur.execute("SELECT server_id FROM Servers WHERE environment = %s", ("production",))
-            result = cur.fetchone()
-            server_id = result[0] if result else 1
-
-            cur.execute(
-                """
-                INSERT INTO Devices (serial, mqtt_broker_url)
-                VALUES (%s, %s)
-                ON CONFLICT (serial) DO NOTHING
-                """,
-                (device_serial, "mqtts://mqtt.locacoeur.com:8883")
-            )
-
-            if topic_category == "event":
+            # Insert into Devices table
+            try:
                 cur.execute(
                     """
-                    INSERT INTO Events (
-                        device_serial, server_id, operation_id, topic, message_id, 
-                        payload, event_timestamp, created_at, original_timestamp
-                    )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (device_serial, topic, event_timestamp) DO UPDATE SET
-                        created_at = EXCLUDED.created_at,
-                        original_timestamp = EXCLUDED.original_timestamp
+                    INSERT INTO Devices (device_serial)
+                    VALUES (%s)
+                    ON CONFLICT (device_serial) DO NOTHING
                     """,
-                    (
-                        device_serial,
-                        server_id,
-                        operation_id,
-                        topic,
-                        operation_id,
-                        payload_str,
-                        parsed_timestamp,
-                        datetime.now(timezone.utc),
-                        str(data.get("timestamp"))
-                    )
+                    (device_serial[:50],)
                 )
+            except psycopg2.errors.UniqueViolation:
+                logger.debug(f"Duplicate device record skipped for {device_serial}")
+                conn.rollback()
+                cur = conn.cursor()  # Re-create cursor after rollback
+            except Exception as e:
+                logger.error(f"Error inserting into Devices for {device_serial}: {e}")
+                conn.rollback()
+                self.send_alert_email(
+                    "Database Error",
+                    f"Failed to insert into Devices for {device_serial}: {e}",
+                    "critical"
+                )
+                return
 
-                led_updates = {}
-                alert_id = data.get("id") if operation_id == "Alert" else None
-                if alert_id == 2:
-                    led_updates["Power"] = ("Red", "Device is running on battery power")
-                elif alert_id == 3:
-                    led_updates["Defibrillator"] = ("Red", "Indicates a fault in the defibrillator")
-                elif operation_id == "Status":
-                    if "led_power" in data:
-                        led_updates["Power"] = (
-                            data["led_power"],
-                            "Device is powered by an external power supply" if data["led_power"] == "Green" else "Device is running on battery power"
-                        )
-                    if "led_defibrillator" in data:
-                        led_updates["Defibrillator"] = (
-                            data["led_defibrillator"],
-                            "Defibrillator is functioning normally" if data["led_defibrillator"] == "Green" else "Indicates a fault in the defibrillator"
-                        )
-                    if "led_monitoring" in data:
-                        led_updates["Monitoring"] = (
-                            data["led_monitoring"],
-                            "Monitoring is active" if data["led_monitoring"] == "Green" else "Monitoring is disabled"
-                        )
-                    if "led_assistance" in data:
-                        led_updates["Assistance"] = (
-                            data["led_assistance"],
-                            "Assistance mode is enabled" if data["led_assistance"] == "Green" else "Assistance is disabled"
-                        )
-                    if "led_mqtt" in data:
-                        led_updates["MQTT"] = (
-                            data["led_mqtt"],
-                            "Connected to the MQTT broker successfully" if data["led_mqtt"] == "Green" else "Disconnected from the MQTT broker"
-                        )
-                    if "led_environmental" in data:
-                        led_updates["Environmental"] = (
-                            data["led_environmental"],
-                            "Neither fan nor heater is active" if data["led_environmental"] == "Off" else "Temperature is outside safe limits"
-                        )
+            # Insert into Events table
+            try:
+                cur.execute(
+                    """
+                    INSERT INTO Events (device_serial, timestamp, type, raw_payload)
+                    VALUES (%s, %s, %s, %s)
+                    """,
+                    (device_serial[:50], timestamp, event_type[:50], json.dumps(payload))
+                )
+            except psycopg2.errors.UniqueViolation:
+                logger.debug(f"Duplicate event record skipped for {device_serial} on topic {topic}")
+                conn.rollback()
+                cur = conn.cursor()
+            except Exception as e:
+                logger.error(f"Error inserting into Events for {device_serial}: {e}")
+                conn.rollback()
+                self.send_alert_email(
+                    "Database Error",
+                    f"Failed to insert into Events for {device_serial} on topic {topic}: {e}",
+                    "critical"
+                )
+                return
 
-                for led_type, (status, description) in led_updates.items():
+            # Handle 'location' event
+            if event_type == "location":
+                lat = event.get("latitude")
+                lon = event.get("longitude")
+                if lat is None or lon is None:
+                    logger.warning(f"Incomplete location data from {device_serial}")
+                    return
+                try:
                     cur.execute(
                         """
-                        INSERT INTO LEDs (device_serial, led_type, status, description, last_updated)
-                        VALUES (%s, %s, %s, %s, %s)
-                        ON CONFLICT (device_serial, led_type) DO UPDATE
-                        SET status = EXCLUDED.status, description = EXCLUDED.description, last_updated = EXCLUDED.last_updated
+                        INSERT INTO Locations (device_serial, timestamp, latitude, longitude)
+                        VALUES (%s, %s, %s, %s)
                         """,
-                        (device_serial, led_type, status, description, datetime.now(timezone.utc))
+                        (device_serial[:50], timestamp, lat, lon)
                     )
+                except psycopg2.errors.UniqueViolation:
+                    logger.debug(f"Duplicate location record skipped for {device_serial} at timestamp {timestamp}")
+                    conn.rollback()
+                    cur = conn.cursor()
+                except Exception as e:
+                    logger.error(f"Error inserting into Locations for {device_serial}: {e}")
+                    conn.rollback()
+                    self.send_alert_email(
+                        "Database Error",
+                        f"Failed to insert into Locations for {device_serial}: {e}",
+                        "critical"
+                    )
+                    return
 
-            elif topic_category == "command":
-                is_get = len(topic_parts) > 4 and topic_parts[4] == "get"
-                cur.execute(
-                    """
-                    INSERT INTO Commands (
-                        device_serial, server_id, operation_id, topic, message_id, payload, created_at, is_get
+            # Handle 'version' event
+            elif event_type == "version":
+                version = event.get("firmware")
+                if not version:
+                    logger.warning(f"Missing firmware version from {device_serial}")
+                    return
+                try:
+                    cur.execute(
+                        """
+                        INSERT INTO Versions (device_serial, timestamp, version)
+                        VALUES (%s, %s, %s)
+                        ON CONFLICT (device_serial, timestamp) DO UPDATE SET version = EXCLUDED.version, timestamp = EXCLUDED.timestamp
+                        """,
+                        (device_serial[:50], timestamp, version[:50])
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                    """,
-                    (
-                        device_serial,
-                        server_id,
-                        operation_id,
-                        topic,
-                        operation_id,
-                        payload_str,
-                        datetime.now(timezone.utc),
-                        is_get
+                except psycopg2.errors.UniqueViolation:
+                    logger.debug(f"Duplicate version record skipped for {device_serial} at timestamp {timestamp}")
+                    conn.rollback()
+                    cur = conn.cursor()
+                except Exception as e:
+                    logger.error(f"Error inserting into Versions for {device_serial}: {e}")
+                    conn.rollback()
+                    self.send_alert_email(
+                        "Database Error",
+                        f"Failed to insert into Versions for {device_serial}: {e}",
+                        "critical"
                     )
-                )
+                    return
 
-            elif topic_category == "result":
-                result_status = str(data.get("result", ""))[:50]
-                result_message = data.get("message")
-                cur.execute(
-                    """
-                    SELECT command_id FROM Commands
-                    WHERE device_serial = %s
-                    ORDER BY created_at DESC LIMIT 1
-                    """,
-                    (device_serial,)
-                )
-                command_id = cur.fetchone()[0] if cur.rowcount > 0 else None
-                cur.execute(
-                    """
-                    INSERT INTO Results (
-                        command_id, device_serial, topic, result_status, result_message, payload, created_at
+            # Handle 'status' event
+            elif event_type == "status":
+                status = event.get("state")
+                if not status:
+                    logger.warning(f"Missing status from {device_serial}")
+                    return
+                try:
+                    cur.execute(
+                        """
+                        INSERT INTO Status (device_serial, timestamp, state)
+                        VALUES (%s, %s, %s)
+                        """,
+                        (device_serial[:50], timestamp, status[:50])
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
-                    """,
-                    (
-                        command_id,
-                        device_serial,
-                        topic,
-                        result_status,
-                        result_message,
-                        payload_str,
-                        datetime.now(timezone.utc)
+                except psycopg2.errors.UniqueViolation:
+                    logger.debug(f"Duplicate status record skipped for {device_serial} at timestamp {timestamp}")
+                    conn.rollback()
+                    cur = conn.cursor()
+                except Exception as e:
+                    logger.error(f"Error inserting into Status for {device_serial}: {e}")
+                    conn.rollback()
+                    self.send_alert_email(
+                        "Database Error",
+                        f"Failed to insert into Status for {device_serial}: {e}",
+                        "critical"
                     )
-                )
+                    return
 
-            if topic_category == "event":
-                self.detect_critical_alerts(device_serial, topic, data)
-                self.insert_device_data(device_serial, topic, data)
+            # Handle 'alert' event
+            elif event_type == "alert":
+                alert_code = event.get("code")
+                if not alert_code:
+                    logger.warning(f"Missing alert code from {device_serial}")
+                    return
+                cache_key = f"{device_serial}:{alert_code}"
+                if cache_key not in self.alert_cache:
+                    self.alert_cache[cache_key] = True
+                    self.send_alert_email(
+                        "Device Alert",
+                        f"Alert {alert_code} from device {device_serial}",
+                        "warning"
+                    )
+                try:
+                    cur.execute(
+                        """
+                        INSERT INTO Alerts (device_serial, timestamp, code)
+                        VALUES (%s, %s, %s)
+                        """,
+                        (device_serial[:50], timestamp, alert_code[:50])
+                    )
+                except psycopg2.errors.UniqueViolation:
+                    logger.debug(f"Duplicate alert record skipped for {device_serial} with code {alert_code}")
+                    conn.rollback()
+                    cur = conn.cursor()
+                except Exception as e:
+                    logger.error(f"Error inserting into Alerts for {device_serial}: {e}")
+                    conn.rollback()
+                    self.send_alert_email(
+                        "Database Error",
+                        f"Failed to insert into Alerts for {device_serial}: {e}",
+                        "critical"
+                    )
+                    return
+
+            # Handle LEDs
+            leds = event.get("leds")
+            if leds:
+                for led in leds:
+                    led_type = led.get("type")
+                    state = led.get("state")
+                    if not led_type or state is None:
+                        continue
+                    try:
+                        cur.execute(
+                            """
+                            INSERT INTO LEDs (device_serial, timestamp, type, state)
+                            VALUES (%s, %s, %s, %s)
+                            ON CONFLICT (device_serial, type) DO UPDATE SET state = EXCLUDED.state, timestamp = EXCLUDED.timestamp
+                            """,
+                            (device_serial[:50], timestamp, led_type[:50], state[:50])
+                        )
+                    except psycopg2.errors.UniqueViolation:
+                        logger.debug(f"Duplicate LED record skipped for {device_serial}, type {led_type}")
+                        conn.rollback()
+                        cur = conn.cursor()
+                    except Exception as e:
+                        logger.error(f"Error inserting into LEDs for {device_serial}, type {led_type}: {e}")
+                        conn.rollback()
+                        self.send_alert_email(
+                            "Database Error",
+                            f"Failed to insert into LEDs for {device_serial}, type {led_type}: {e}",
+                            "critical"
+                        )
+                        continue
+
+            # Handle Results
+            result = payload.get("result")
+            if result:
+                op_id = result.get("opId")
+                res = result.get("value")
+                if op_id:
+                    try:
+                        cur.execute(
+                            """
+                            INSERT INTO Results (device_serial, timestamp, op_id, result)
+                            VALUES (%s, %s, %s, %s)
+                            ON CONFLICT (op_id) DO UPDATE SET result = EXCLUDED.result, timestamp = EXCLUDED.timestamp
+                            """,
+                            (device_serial[:50], timestamp, op_id[:50], res)
+                        )
+                    except psycopg2.errors.UniqueViolation:
+                        logger.debug(f"Duplicate result record skipped for {device_serial}, op_id {op_id}")
+                        conn.rollback()
+                        cur = conn.cursor()
+                    except Exception as e:
+                        logger.error(f"Error inserting into Results for {device_serial}: {e}")
+                        conn.rollback()
+                        self.send_alert_email(
+                            "Database Error",
+                            f"Failed to insert into Results for {device_serial}: {e}",
+                            "critical"
+                        )
+                        return
+
+            # Handle Commands
+            command = payload.get("command")
+            if command:
+                op_id = command.get("opId")
+                action = command.get("action")
+                if op_id and action:
+                    with self.command_lock:
+                        self.command_cache[op_id] = {"device_serial": device_serial, "action": action}
+                    try:
+                        cur.execute(
+                            """
+                            INSERT INTO Commands (device_serial, timestamp, op_id, action)
+                            VALUES (%s, %s, %s, %s)
+                            ON CONFLICT (op_id) DO NOTHING
+                            """,
+                            (device_serial[:50], timestamp, op_id[:50], action[:50])
+                        )
+                    except psycopg2.errors.UniqueViolation:
+                        logger.debug(f"Duplicate command record skipped for {device_serial}, op_id {op_id}")
+                        conn.rollback()
+                        cur = conn.cursor()
+                    except Exception as e:
+                        logger.error(f"Error inserting into Commands for {device_serial}: {e}")
+                        conn.rollback()
+                        self.send_alert_email(
+                            "Database Error",
+                            f"Failed to insert into Commands for {device_serial}: {e}",
+                            "critical"
+                        )
+                        return
 
             conn.commit()
             logger.info(f"Data processed for device {device_serial} from topic {topic}")
-        except psycopg2.errors.UniqueViolation as e:
-            logger.debug(f"Duplicate record skipped for device {device_serial} on topic {topic}")
-            conn.rollback()
+
         except Exception as e:
-            logger.error(f"Database error for device {device_serial}: {e}")
+            logger.error(f"Unexpected error for device {device_serial}: {e}")
             conn.rollback()
             self.send_alert_email(
-                "Database Error",
-                f"Failed to insert data for device {device_serial} on topic {topic}: {e}",
+                "Unexpected Error",
+                f"Unexpected error processing data for {device_serial} on topic {topic}: {e}",
                 "critical"
             )
         finally:
@@ -1314,6 +1441,7 @@ class MQTTService:
                 f"Failed to send config update for device {device_serial}: {e}",
                 "critical"
             )
+
     def request_location(self, device_serial: str) -> None:
         """Request the current device location."""
         try:
@@ -1332,7 +1460,7 @@ class MQTTService:
 
     def request_log(self, device_serial: str) -> None:
         try:
-            op_id = str(uuid.uuid4())  # Keep op_id for logging, but don't send in payload
+            op_id = str(uuid.uuid4())
             topic = f"LC1/{device_serial}/command/log"
             payload = {}
             self.client.publish(topic, json.dumps(payload), qos=0)
@@ -1344,7 +1472,7 @@ class MQTTService:
                 f"Failed to send log request for device {device_serial}: {e}",
                 "warning"
             )
-            
+
     def play_audio(self, device_serial: str, audio_message: str) -> None:
         """Send audio playback command."""
         valid_messages = ["message_1", "message_2"]
@@ -1369,6 +1497,7 @@ class MQTTService:
                 f"Failed to send audio play command for device {device_serial}: {e}",
                 "critical"
             )
+
     def insert_config_data(self, device_serial: str, topic: str, data: Dict[str, Any]) -> None:
         """Insert config data into the Events table"""
         conn = self.connect_db()
@@ -1471,7 +1600,7 @@ class MQTTService:
             self.release_db(conn)
 
     def on_connect(self, client, userdata, flags, reason_code, properties=None):
-        """MQTT connection callback"""
+        """MQTT connection callback (unchanged)"""
         if reason_code == 0:
             logger.info(f"Connected to MQTT broker at {MQTT_BROKER}:{MQTT_PORT} with client ID {MQTT_CLIENT_ID}")
             self.last_connection_time = datetime.now(timezone.utc)
@@ -1488,47 +1617,102 @@ class MQTTService:
                 self.send_alert_email("MQTT Connection Failed", f"Failed to connect to MQTT broker after {self.reconnect_count} attempts. Reason code: {reason_code}", "critical")
 
     def on_message(self, client, userdata, msg):
-        """Handle incoming MQTT messages"""
+        """Handle incoming MQTT messages with fixed deduplication"""
         try:
             topic = msg.topic
-            payload = json.loads(msg.payload.decode("utf-8"))
-            device_serial = topic.split("/")[1]
-            operation = topic.split("/")[2]
+            payload = msg.payload.decode('utf-8')
+            logger.debug(f"Received message on topic {topic}: {payload}")
+            message_id = hashlib.sha256(f"{topic}:{payload}".encode()).hexdigest()
+            with self.message_lock:
+                if message_id in self.processed_messages:
+                    logger.warning(f"Duplicate message detected for topic {topic}, message_id {message_id}")
+                    return
+                self.processed_messages.append(message_id)  # Use deque append
 
-            if operation == "event":
-                event_type = topic.split("/")[-1]
-                if event_type in ["status", "location", "alert"]:
-                    self.insert_device_data(device_serial, topic, payload)
-                elif event_type == "version":
-                    self.insert_version_data(device_serial, topic, payload)
-                elif event_type == "log":
-                    self.insert_log_data(device_serial, topic, msg.payload.decode("utf-8"))
-            elif operation == "command":
-                self.insert_command(device_serial, topic, payload)
-            elif operation == "result":
-                self.insert_result(device_serial, topic, payload)
+            if not payload:
+                logger.warning(f"Empty payload received on topic {topic}")
+                return
+            try:
+                data = json.loads(payload)
+            except json.JSONDecodeError as e:
+                logger.error(f"Invalid JSON in payload on topic {topic}: {e}")
+                self.send_alert_email(
+                    "Invalid Payload",
+                    f"Failed to parse JSON on topic {topic}: {e}",
+                    "warning"
+                )
+                return
+
+            device_serial = topic.split('/')[1]
+            if not device_serial or len(topic.split('/')) < 3:
+                logger.error(f"Invalid topic format: {topic}")
+                self.send_alert_email(
+                    "Invalid Topic",
+                    f"Invalid topic format: {topic}",
+                    "warning"
+                )
+                return
+
+            # Adapt payload for insert_data
+            event_type = topic.split('/')[2] if len(topic.split('/')) > 2 else None
+            operation_id = topic.split('/')[3] if len(topic.split('/')) > 3 else None
+            adapted_payload = {
+                "device_serial": device_serial,
+                "timestamp": data.get("timestamp", int(time.time() * 1000)),
+                "event": {"type": operation_id}
+            }
+            if event_type == "event":
+                if operation_id == "location":
+                    adapted_payload["event"].update({
+                        "latitude": data.get("latitude"),
+                        "longitude": data.get("longitude")
+                    })
+                elif operation_id == "version":
+                    adapted_payload["event"]["firmware"] = data.get("version")
+                elif operation_id == "status":
+                    adapted_payload["event"]["state"] = data.get("state")
+                    adapted_payload["event"]["leds"] = [
+                        {"type": key[4:], "state": value}
+                        for key, value in data.items()
+                        if key.startswith("led_") and value in {"Green", "Red", "Off"}
+                    ]
+                elif operation_id == "alert":
+                    adapted_payload["event"]["code"] = data.get("message")
+            elif event_type == "result":
+                adapted_payload["result"] = {
+                    "opId": data.get("opId"),
+                    "value": data.get("result")
+                }
+            elif event_type == "command":
+                adapted_payload["command"] = {
+                    "opId": data.get("opId"),
+                    "action": operation_id
+                }
+
+            self.insert_data(topic, adapted_payload)
             logger.info(f"Data processed for device {device_serial} from topic {topic}")
         except Exception as e:
             logger.error(f"Error processing message on topic {topic}: {e}")
             self.send_alert_email(
                 "Message Processing Error",
-                f"Failed to process message for device {device_serial} on topic {topic}: {e}",
+                f"Failed to process message on topic {topic}: {e}",
                 "critical"
             )
-            return
 
     def on_disconnect(self, client, userdata, flags, reason_code, properties=None):
-        """MQTT disconnect callback"""
+        """MQTT disconnect callback (unchanged)"""
         logger.warning(f"Disconnected from MQTT broker with reason code {reason_code}")
         if self.running:
             self.reconnect_count += 1
             self.send_alert_email("MQTT Disconnection", f"Disconnected from MQTT broker. Reason code: {reason_code}. Reconnect attempt: {self.reconnect_count}", "warning")
 
+
     def on_log(self, client, userdata, level, buf):
-        """MQTT log callback"""
+        """MQTT log callback (unchanged)"""
         logger.debug(f"MQTT log: {buf}")
 
     def connect_with_retry(self, max_retries=10, retry_delay=10, max_total_attempts=50):
+        """Connect to MQTT broker with retry logic (unchanged)"""
         total_attempts = 0
         while self.running and total_attempts < max_total_attempts:
             for attempt in range(max_retries):
@@ -1562,7 +1746,7 @@ class MQTTService:
             certfile=MQTT_CLIENT_CERT,
             keyfile=MQTT_CLIENT_KEY,
             cert_reqs=ssl.CERT_REQUIRED,
-            tls_version=ssl.PROTOCOL_TLS
+            tls_version=ssl.PROTOCOL_TLSv1_2  # Specify TLS version
         )
         if MQTT_USERNAME and MQTT_PASSWORD:
             self.client.username_pw_set(username=MQTT_USERNAME, password=MQTT_PASSWORD)
@@ -1571,7 +1755,9 @@ class MQTTService:
         self.client.on_disconnect = self.on_disconnect
         self.client.on_log = self.on_log
 
+
     def run(self):
+        """Run the MQTT service (unchanged)"""
         logger.info("Starting LOCACOEUR MQTT service...")
         threading.Timer(86400, self.backup_device_data).start()
         connected = False
@@ -1580,11 +1766,9 @@ class MQTTService:
             if not connected:
                 logger.error("Failed to connect to MQTT broker. Retrying in 30 seconds...")
                 time.sleep(30)
-        
         if not connected:
             logger.error("Failed to connect to MQTT broker after all retries")
             return False
-        
         try:
             self.client.loop_start()
             while self.running:
