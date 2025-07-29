@@ -123,15 +123,18 @@ class MQTTService:
         except Exception as e:
             logger.error(f"Failed to release database connection: {e}")
 
-    def get_server_id(self) -> int:
-        """Retrieve or create server_id for the current server"""
+    def get_server_id(self) -> Optional[int]:
+        """Retrieve or create server_id for the current server with better error handling"""
         conn = self.connect_db()
         if not conn:
             logger.error("Failed to connect to database for server_id retrieval")
             return None
+        
         try:
             cur = conn.cursor()
             mqtt_url = "mqtts://mqtt.locacoeur.com:8883"
+            
+            # First try to get existing server_id
             cur.execute(
                 """
                 SELECT server_id FROM Servers
@@ -141,20 +144,29 @@ class MQTTService:
             )
             result = cur.fetchone()
             if result:
-                return result[0]
+                server_id = result[0]
+                logger.debug(f"Found existing server_id: {server_id}")
+                return server_id
 
-            cur.execute(
-                """
-                INSERT INTO Servers (environment, mqtt_url)
-                VALUES (%s, %s)
-                ON CONFLICT (environment) DO NOTHING
-                RETURNING server_id
-                """,
-                ("production", mqtt_url)
-            )
-            result = cur.fetchone()
-            server_id = result[0] if result else None
-            if server_id is None:
+            # Try to insert new server record
+            try:
+                cur.execute(
+                    """
+                    INSERT INTO Servers (environment, mqtt_url)
+                    VALUES (%s, %s)
+                    RETURNING server_id
+                    """,
+                    ("production", mqtt_url)
+                )
+                result = cur.fetchone()
+                if result:
+                    server_id = result[0]
+                    conn.commit()
+                    logger.info(f"Created new server_id: {server_id} for environment='production'")
+                    return server_id
+            except psycopg2.errors.UniqueViolation:
+                # Another process might have inserted it
+                conn.rollback()
                 cur.execute(
                     """
                     SELECT server_id FROM Servers
@@ -163,15 +175,26 @@ class MQTTService:
                     ("production", mqtt_url)
                 )
                 result = cur.fetchone()
-                server_id = result[0] if result else None
-            if server_id is None:
-                raise ValueError("Failed to retrieve or create server_id")
-            conn.commit()
-            logger.info(f"Created or retrieved server_id {server_id} for environment='production'")
-            return server_id
+                if result:
+                    server_id = result[0]
+                    logger.info(f"Retrieved server_id after conflict: {server_id}")
+                    return server_id
+            
+            # If we still don't have a server_id, something is wrong
+            logger.error("Failed to retrieve or create server_id")
+            self.send_alert_email(
+                "Database Error",
+                "Failed to retrieve or create server_id",
+                "critical"
+            )
+            return None
+            
         except Exception as e:
             logger.error(f"Error retrieving or creating server_id: {e}")
-            conn.rollback()
+            try:
+                conn.rollback()
+            except:
+                pass
             self.send_alert_email(
                 "Database Error",
                 f"Failed to retrieve or create server_id: {e}",
@@ -179,7 +202,10 @@ class MQTTService:
             )
             return None
         finally:
-            cur.close()
+            try:
+                cur.close()
+            except:
+                pass
             self.release_db(conn)
 
     def initialize_db(self):
@@ -1728,8 +1754,8 @@ class MQTTService:
                     return
                 self.processed_messages.append(message_id)
 
-            device_serial = topic.split('/')[1]
-            if not device_serial or len(topic.split('/')) < 3:
+            topic_parts = topic.split('/')
+            if len(topic_parts) < 3:
                 logger.error(f"Invalid topic format: {topic}")
                 self.send_alert_email(
                     "Invalid Topic",
@@ -1738,52 +1764,51 @@ class MQTTService:
                 )
                 return
 
-            # Adapt payload for insert_data
-            event_type = topic.split('/')[2]
-            operation_id = topic.split('/')[3] if len(topic.split('/')) > 3 else None
-            adapted_payload = {
-                "device_serial": device_serial,
-                "timestamp": timestamp,
-                "event": {"type": operation_id}
-            }
+            device_serial = topic_parts[1]
+            event_type = topic_parts[2]
+            operation_id = topic_parts[3] if len(topic_parts) > 3 else None
+
+            if not device_serial:
+                logger.error(f"Invalid device serial in topic: {topic}")
+                self.send_alert_email(
+                    "Invalid Topic",
+                    f"Invalid device serial in topic: {topic}",
+                    "warning"
+                )
+                return
+
+            # Route to appropriate handler based on topic structure
             if event_type == "event":
                 if operation_id == "location":
-                    adapted_payload["event"].update({
-                        "latitude": data.get("latitude"),
-                        "longitude": data.get("longitude")
-                    })
-                elif operation_id == "version":
-                    adapted_payload["event"]["firmware"] = data.get("version")
+                    self.insert_device_data(device_serial, topic, data)
                 elif operation_id == "status":
-                    led_fields = [
-                        {"type": key[4:], "state": value}
-                        for key, value in data.items()
-                        if key.startswith("led_") and value in {"Green", "Red", "Off"}
-                    ]
-                    if not led_fields:
-                        logger.warning(f"No valid LED fields in status payload for {device_serial}: {data}")
-                        self.send_alert_email(
-                            "Invalid Status Payload",
-                            f"No valid LED fields in status payload for {device_serial}: {data}",
-                            "warning"
-                        )
-                    adapted_payload["event"]["state"] = data.get("state")
-                    adapted_payload["event"]["leds"] = led_fields
+                    self.insert_device_data(device_serial, topic, data)
                 elif operation_id == "alert":
-                    adapted_payload["event"]["code"] = data.get("message") or data.get("id")
+                    self.insert_device_data(device_serial, topic, data)
+                elif operation_id == "version":
+                    self.insert_version_data(device_serial, topic, data)
+                elif operation_id == "log":
+                    self.insert_log_data(device_serial, topic, data)
+                elif operation_id == "config":
+                    self.insert_config_data(device_serial, topic, data)
+                else:
+                    logger.warning(f"Unknown event operation: {operation_id} for topic {topic}")
+                    # Still try to process as generic event
+                    self.insert_device_data(device_serial, topic, data)
             elif event_type == "result":
-                adapted_payload["result"] = {
-                    "opId": data.get("opId"),
-                    "value": data.get("result")
-                }
+                self.insert_result(device_serial, topic, data)
             elif event_type == "command":
-                adapted_payload["command"] = {
-                    "opId": data.get("opId"),
-                    "action": operation_id
-                }
+                self.insert_command(device_serial, topic, data)
+            else:
+                logger.warning(f"Unknown event type: {event_type} for topic {topic}")
+                # Fallback to generic processing
+                self.insert_device_data(device_serial, topic, data)
 
-            self.insert_data(topic, adapted_payload)
-            logger.info(f"Data processed for device {device_serial} from topic {topic}")
+            # Detect critical alerts
+            self.detect_critical_alerts(device_serial, topic, data)
+            
+            logger.info(f"Message processed for device {device_serial} from topic {topic}")
+            
         except Exception as e:
             logger.error(f"Error processing message on topic {topic}: {e}")
             self.send_alert_email(
