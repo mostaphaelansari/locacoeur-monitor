@@ -210,7 +210,8 @@ class MQTTService:
                     message_id VARCHAR(50),
                     payload JSONB,
                     created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-                    is_get BOOLEAN
+                    is_get BOOLEAN,
+                    UNIQUE (device_serial, operation_id)
                 );
                 CREATE TABLE IF NOT EXISTS Results (
                     result_id SERIAL PRIMARY KEY,
@@ -1157,7 +1158,7 @@ class MQTTService:
                 )
                 return
 
-            parsed_timestamp = self.parse_timestamp(timestamp, device_serial, return_unix=True)
+            parsed_timestamp = self.parse_timestamp(timestamp, device_serial, return_unix=False)
             if parsed_timestamp is None:
                 logger.error(f"Invalid timestamp for topic {topic}: {timestamp}")
                 self.send_alert_email(
@@ -1199,6 +1200,14 @@ class MQTTService:
             # Validate payload based on operation
             if topic_category == "event":
                 event = payload.get("event", {})
+                if not isinstance(event, dict):
+                    logger.error(f"Invalid event payload for {device_serial}: {payload}")
+                    self.send_alert_email(
+                        "Invalid Payload",
+                        f"Invalid event payload for {device_serial}: {payload}",
+                        "warning"
+                    )
+                    return
                 if operation_id == "location":
                     if not all(key in event for key in ["latitude", "longitude"]):
                         logger.error(f"Invalid location payload for {device_serial}: {payload}")
@@ -1217,7 +1226,7 @@ class MQTTService:
                             """,
                             (
                                 device_serial[:50],
-                                parsed_timestamp,
+                                int(parsed_timestamp.timestamp() * 1000),
                                 float(event["latitude"]),
                                 float(event["longitude"])
                             )
@@ -1249,7 +1258,7 @@ class MQTTService:
                             """,
                             (
                                 device_serial[:50],
-                                parsed_timestamp,
+                                int(parsed_timestamp.timestamp() * 1000),
                                 event["firmware"][:50]
                             )
                         )
@@ -1263,11 +1272,12 @@ class MQTTService:
                         )
                         return
                 elif operation_id == "status":
-                    if not event.get("leds"):
-                        logger.error(f"Invalid status payload for {device_serial}: {payload}")
+                    leds = event.get("leds", [])
+                    if not isinstance(leds, list):
+                        logger.error(f"Invalid status payload for {device_serial}: LEDs must be a list")
                         self.send_alert_email(
                             "Invalid Payload",
-                            f"Status event missing LED data for {device_serial}: {payload}",
+                            f"Status event LEDs must be a list for {device_serial}: {payload}",
                             "warning"
                         )
                         return
@@ -1280,11 +1290,11 @@ class MQTTService:
                             """,
                             (
                                 device_serial[:50],
-                                parsed_timestamp,
+                                int(parsed_timestamp.timestamp() * 1000),
                                 event.get("state", "")[:50]
                             )
                         )
-                        for led in event.get("leds", []):
+                        for led in leds:
                             led_type = led.get("type")
                             status = led.get("state")
                             if led_type and status in {"Green", "Red", "Off"}:
@@ -1337,7 +1347,7 @@ class MQTTService:
                             """,
                             (
                                 device_serial[:50],
-                                parsed_timestamp,
+                                int(parsed_timestamp.timestamp() * 1000),
                                 code[:50]
                             )
                         )
@@ -1362,7 +1372,7 @@ class MQTTService:
                             """
                             INSERT INTO Commands (device_serial, operation_id, topic, payload, created_at, is_get)
                             VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP, %s)
-                            ON CONFLICT (operation_id) DO NOTHING
+                            ON CONFLICT (device_serial, operation_id) DO NOTHING
                             """,
                             (
                                 device_serial[:50],
@@ -1745,12 +1755,20 @@ class MQTTService:
                 elif operation_id == "version":
                     adapted_payload["event"]["firmware"] = data.get("version")
                 elif operation_id == "status":
-                    adapted_payload["event"]["state"] = data.get("state")
-                    adapted_payload["event"]["leds"] = [
+                    led_fields = [
                         {"type": key[4:], "state": value}
                         for key, value in data.items()
                         if key.startswith("led_") and value in {"Green", "Red", "Off"}
                     ]
+                    if not led_fields:
+                        logger.warning(f"No valid LED fields in status payload for {device_serial}: {data}")
+                        self.send_alert_email(
+                            "Invalid Status Payload",
+                            f"No valid LED fields in status payload for {device_serial}: {data}",
+                            "warning"
+                        )
+                    adapted_payload["event"]["state"] = data.get("state")
+                    adapted_payload["event"]["leds"] = led_fields
                 elif operation_id == "alert":
                     adapted_payload["event"]["code"] = data.get("message") or data.get("id")
             elif event_type == "result":
