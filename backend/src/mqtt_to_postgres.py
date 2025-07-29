@@ -653,15 +653,17 @@ class MQTTService:
             self.release_db(conn)
 
     def insert_device_data(self, device_serial: str, topic: str, data: Dict[str, Any]) -> None:
-        """Insert device data into the device_data table"""
+        """Insert device data into the device_data table with improved error handling"""
         conn = self.connect_db()
         if not conn:
             logger.error("Failed to connect to database")
             return
+        
         try:
             cur = conn.cursor()
             payload_str = json.dumps(data, sort_keys=True)
             timestamp = self.parse_timestamp(data.get("timestamp"), device_serial, return_unix=True)
+            
             if timestamp is None:
                 logger.error(f"Invalid timestamp for device {device_serial} on topic {topic}")
                 self.send_alert_email(
@@ -670,18 +672,37 @@ class MQTTService:
                     "warning"
                 )
                 return
-            cur.execute(
-                """
-                INSERT INTO Devices (serial, mqtt_broker_url)
-                VALUES (%s, %s)
-                ON CONFLICT (serial) DO NOTHING
-                """,
-                (device_serial[:50], "mqtts://mqtt.locacoeur.com:8883")
-            )
+
+            # Insert or update device record with improved error handling
+            try:
+                cur.execute(
+                    """
+                    INSERT INTO Devices (serial, mqtt_broker_url)
+                    VALUES (%s, %s)
+                    ON CONFLICT (serial) DO NOTHING
+                    """,
+                    (device_serial[:50], "mqtts://mqtt.locacoeur.com:8883")
+                )
+            except psycopg2.errors.UniqueViolation:
+                logger.debug(f"Duplicate device record skipped for {device_serial}")
+                conn.rollback()
+                cur = conn.cursor()
+            except Exception as e:
+                logger.error(f"Error inserting into Devices for {device_serial}: {e}")
+                conn.rollback()
+                self.send_alert_email(
+                    "Database Error",
+                    f"Failed to insert into Devices for {device_serial}: {e}",
+                    "critical"
+                )
+                return
+
+            # Handle location events
             if topic.endswith("/event/location"):
                 latitude = data.get("latitude")
                 longitude = data.get("longitude")
                 logger.debug(f"Processing location event for {device_serial}: latitude={latitude}, longitude={longitude}")
+                
                 if not isinstance(latitude, (int, float)) or not isinstance(longitude, (int, float)):
                     logger.error(f"Invalid location data types for device {device_serial}: latitude={latitude}, longitude={longitude}")
                     self.send_alert_email(
@@ -690,6 +711,7 @@ class MQTTService:
                         "warning"
                     )
                     return
+                
                 if not (-90 <= latitude <= 90) or not (-180 <= longitude <= 180):
                     logger.error(f"Invalid location data for device {device_serial}: latitude={latitude}, longitude={longitude}")
                     self.send_alert_email(
@@ -698,6 +720,7 @@ class MQTTService:
                         "warning"
                     )
                     return
+                
                 cur.execute(
                     """
                     INSERT INTO device_data (
@@ -717,6 +740,8 @@ class MQTTService:
                         payload_str
                     )
                 )
+
+            # Handle status events
             elif topic.endswith("/event/status"):
                 battery = data.get("battery")
                 led_power = data.get("led_power")
@@ -725,10 +750,13 @@ class MQTTService:
                 led_assistance = data.get("led_assistance")
                 led_mqtt = data.get("led_mqtt")
                 led_environmental = data.get("led_environmental")
+                
                 logger.debug(f"Processing status event for {device_serial}: battery={battery}, "
                             f"led_power={led_power}, led_defibrillator={led_defibrillator}, "
                             f"led_monitoring={led_monitoring}, led_assistance={led_assistance}, "
                             f"led_mqtt={led_mqtt}, led_environmental={led_environmental}")
+                
+                # Validate battery value
                 if battery is not None and (not isinstance(battery, int) or not 0 <= battery <= 100):
                     logger.error(f"Invalid battery value for device {device_serial}: {battery}")
                     self.send_alert_email(
@@ -737,6 +765,8 @@ class MQTTService:
                         "warning"
                     )
                     return
+                
+                # Validate LED values
                 valid_leds = {"Green", "Red", "Off"}
                 for led, value in [
                     ("Power", led_power),
@@ -754,6 +784,8 @@ class MQTTService:
                             "warning"
                         )
                         return
+                
+                # Insert status data
                 cur.execute(
                     """
                     INSERT INTO device_data (
@@ -779,6 +811,8 @@ class MQTTService:
                         payload_str
                     )
                 )
+                
+                # Update LEDs table
                 led_values = [
                     ("Power", led_power),
                     ("Defibrillator", led_defibrillator),
@@ -787,6 +821,7 @@ class MQTTService:
                     ("MQTT", led_mqtt),
                     ("Environmental", led_environmental)
                 ]
+                
                 for led_type, status in led_values:
                     if status is not None:
                         logger.debug(f"Inserting LED: device={device_serial}, type={led_type}, status={status}")
@@ -802,22 +837,28 @@ class MQTTService:
                         logger.info(f"Inserted into LEDs for device {device_serial}: type={led_type}, status={status}")
                     else:
                         logger.warning(f"Missing LED value for {led_type} on device {device_serial}")
+                
+                # Send alerts for critical conditions
                 if battery is not None and battery < 20:
                     self.send_alert_email(
                         "Low Battery",
                         f"Low battery for device {device_serial}: {battery}%",
                         "critical"
                     )
+                
                 if led_power == "Red":
                     self.send_alert_email(
                         "Power Supply Issue",
                         f"Power supply issue for device {device_serial}: led_power=Red",
                         "critical"
                     )
+
+            # Handle alert events
             elif topic.endswith("/event/alert"):
                 alert_id = data.get("id")
                 alert_message = data.get("message")
                 logger.debug(f"Processing alert event for {device_serial}: alert_id={alert_id}, alert_message={alert_message}")
+                
                 if not isinstance(alert_id, int):
                     logger.error(f"Invalid alert_id for device {device_serial}: {alert_id}")
                     self.send_alert_email(
@@ -826,6 +867,7 @@ class MQTTService:
                         "warning"
                     )
                     return
+                
                 cur.execute(
                     """
                     INSERT INTO device_data (
@@ -845,13 +887,16 @@ class MQTTService:
                         payload_str
                     )
                 )
+                
                 self.send_alert_email(
                     f"Critical Alert - Device {device_serial}",
                     f"Alert for device {device_serial}: {alert_message}",
                     "critical"
                 )
+
             conn.commit()
             logger.info(f"Inserted into device_data for device {device_serial} on topic {topic}")
+            
         except Exception as e:
             logger.error(f"Database error for device {device_serial}: {e}")
             conn.rollback()
