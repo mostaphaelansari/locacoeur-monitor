@@ -6,6 +6,7 @@ from psycopg2 import pool
 import ssl
 import smtplib
 import signal
+import threading
 import sys
 import time
 from datetime import datetime, timezone, timedelta
@@ -78,6 +79,9 @@ class MQTTService:
         self.setup_signal_handlers()
         self.initialize_db()
         self.setup_mqtt_client()
+        self.command_cache = TTLCache(maxsize=1000, ttl=3600)  # Store commands for 1 hour
+        self.command_lock = threading.Lock()  # Thread-safe access to command_cache
+        self.start_followup_checker()
 
     def setup_signal_handlers(self):
         """Setup signal handlers for graceful shutdown"""
@@ -85,13 +89,18 @@ class MQTTService:
         signal.signal(signal.SIGTERM, self.signal_handler)
 
     def signal_handler(self, signum, frame):
-        """Handle shutdown signals"""
         logger.info(f"Received signal {signum}, shutting down gracefully...")
         self.running = False
         if self.client:
-            self.client.disconnect()
-            self.client.loop_stop()
-        self.db_pool.closeall()
+            try:
+                self.client.disconnect()
+                self.client.loop_stop()
+            except Exception as e:
+                logger.warning(f"Error during MQTT disconnection in signal handler: {e}")
+        try:
+            self.db_pool.closeall()
+        except Exception as e:
+            logger.warning(f"Error closing database pool: {e}")
         sys.exit(0)
 
     def connect_db(self) -> Optional[psycopg2.extensions.connection]:
@@ -110,8 +119,6 @@ class MQTTService:
         except Exception as e:
             logger.error(f"Failed to release database connection: {e}")
 
-    logger = logging.getLogger(__name__)
-
     def get_server_id(self) -> int:
         """Retrieve or create server_id for the current server"""
         conn = self.connect_db()
@@ -120,7 +127,6 @@ class MQTTService:
             return None
         try:
             cur = conn.cursor()
-            # Check for server with environment='production' and mqtt_url
             mqtt_url = "mqtts://mqtt.locacoeur.com:8883"
             cur.execute(
                 """
@@ -133,7 +139,6 @@ class MQTTService:
             if result:
                 return result[0]
 
-            # Insert new server if not exists
             cur.execute(
                 """
                 INSERT INTO Servers (environment, mqtt_url)
@@ -146,7 +151,6 @@ class MQTTService:
             result = cur.fetchone()
             server_id = result[0] if result else None
             if server_id is None:
-                # Fetch server_id if insert failed due to conflict
                 cur.execute(
                     """
                     SELECT server_id FROM Servers
@@ -269,6 +273,73 @@ class MQTTService:
         finally:
             cur.close()
             self.release_db(conn)
+    def start_followup_checker(self):
+        """Start a background thread to check for missing command results."""
+        def check_missing_results():
+            while self.running:
+                try:
+                    self.check_command_timeouts()
+                except Exception as e:
+                    logger.error(f"Error in command timeout checker: {e}")
+                    self.send_alert_email(
+                        "Command Timeout Checker Error",
+                        f"Error in background command timeout checker: {e}",
+                        "critical"
+                    )
+                time.sleep(60)  # Check every minute
+        checker_thread = threading.Thread(target=check_missing_results, daemon=True)
+        checker_thread.start()
+        logger.info("Started command timeout checker thread")
+
+    def check_command_timeouts(self):
+        """Check for commands that haven't received results within 5 minutes."""
+        with self.command_lock:
+            expired_commands = []
+            current_time = datetime.now(timezone.utc)
+            for (device_serial, op_id), (topic, sent_time) in list(self.command_cache.items()):
+                if current_time - sent_time > timedelta(minutes=5):
+                    expired_commands.append((device_serial, op_id, topic, sent_time))
+                    del self.command_cache[(device_serial, op_id)]
+
+        if not expired_commands:
+            return
+
+        conn = self.connect_db()
+        if not conn:
+            logger.error("Failed to connect to database for timeout check")
+            return
+        try:
+            cur = conn.cursor()
+            for device_serial, op_id, topic, sent_time in expired_commands:
+                cur.execute(
+                    """
+                    SELECT result_id FROM Results
+                    WHERE device_serial = %s AND payload->>'opId' = %s
+                    """,
+                    (device_serial, op_id)
+                )
+                if cur.fetchone():
+                    logger.debug(f"Result found for command {op_id} on {device_serial}, no alert needed")
+                    continue
+                logger.warning(f"Command timeout: No result for opId {op_id} on {device_serial} (topic: {topic})")
+                self.send_alert_email(
+                    f"Command Timeout - Device {device_serial}",
+                    f"No result received for command opId {op_id} on topic {topic} "
+                    f"sent at {sent_time.strftime('%Y-%m-%d %H:%M:%S UTC')} after 5 minutes.",
+                    "critical"
+                )
+            conn.commit()
+        except Exception as e:
+            logger.error(f"Database error during timeout check: {e}")
+            conn.rollback()
+            self.send_alert_email(
+                "Database Error",
+                f"Failed to check command timeouts: {e}",
+                "critical"
+            )
+        finally:
+            cur.close()
+            self.release_db(conn)
 
     def backup_device_data(self):
         """Backup old device_data records and clean up"""
@@ -341,8 +412,6 @@ class MQTTService:
                     time.sleep(5)
         logger.error(f"Failed to send email alert after {max_retries} attempts")
 
-    timestamp_logger = logging.getLogger("timestamp_debug")
-
     def parse_timestamp(self, timestamp_value: Any, device_serial: str, return_unix: bool = False) -> Any:
         """Parse timestamps and return UTC datetime or Unix timestamp (milliseconds)"""
         current_time = datetime.now(timezone.utc)
@@ -406,7 +475,7 @@ class MQTTService:
             alert_message = data.get("message")
             if alert_message in critical_alert_messages:
                 alerts.append(f"Critical alert: {alert_message} (ID: {data.get('id')})")
-                self.alert_cache[device_serial] = data  # Store alert for follow-up
+                self.alert_cache[device_serial] = data
 
         battery = data.get("battery")
         if battery is not None and isinstance(battery, (int, float)) and battery < 20:
@@ -438,13 +507,56 @@ class MQTTService:
         else:
             logger.debug(f"No critical alerts detected for device {device_serial} on topic {topic}")
 
+    def request_firmware_version(self, device_serial: str) -> None:
+        """Send a firmware version request to the specified device."""
+        try:
+            op_id = str(uuid.uuid4())
+            topic = f"LC1/{device_serial}/command/version"
+            payload = {"opId": op_id}
+            self.client.publish(topic, json.dumps(payload), qos=0)
+            logger.info(f"Sent firmware version request to {topic} with opId {op_id}")
+        except Exception as e:
+            logger.error(f"Failed to send version request for {device_serial}: {e}")
+            self.send_alert_email(
+                "Version Request Failed",
+                f"Failed to send firmware version request for device {device_serial}: {e}",
+                "warning"
+            )
+
+    def update_firmware(self, device_serial: str, firmware_version: str, firmware_url: str) -> None:
+        """Send a firmware update command to the specified device."""
+        try:
+            op_id = str(uuid.uuid4())
+            topic = f"LC1/{device_serial}/command/update"
+            payload = {
+                "opId": op_id,
+                "version": firmware_version,
+                "url": firmware_url
+            }
+            self.client.publish(topic, json.dumps(payload), qos=0)
+            logger.info(f"Sent firmware update command to {topic} with opId {op_id}, payload: {payload}")
+        except Exception as e:
+            logger.error(f"Failed to send firmware update for {device_serial}: {e}")
+            self.send_alert_email(
+                "Firmware Update Failed",
+                f"Failed to send firmware update command for device {device_serial}: {e}",
+                "critical"
+            )
+
     def insert_command(self, device_serial: str, topic: str, data: Dict[str, Any]) -> None:
-        """Insert command data into the Commands table"""
         conn = self.connect_db()
         if not conn:
             return
         try:
             cur = conn.cursor()
+            if "opId" not in data:
+                logger.error(f"Missing opId in command payload for {device_serial} on topic {topic}")
+                self.send_alert_email(
+                    "Invalid Command Payload",
+                    f"Missing opId in command for {device_serial} on topic {topic}",
+                    "warning"
+                )
+                return
             payload_str = json.dumps(data, sort_keys=True)
             server_id = self.get_server_id()
             if server_id is None:
@@ -455,19 +567,8 @@ class MQTTService:
                     "critical"
                 )
                 return
-
             operation_id = topic.split("/")[-1]
-            if not operation_id:
-                logger.error(f"Invalid operation_id for topic {topic}")
-                self.send_alert_email(
-                    "Database Error",
-                    f"Invalid operation_id for device {device_serial} on topic {topic}",
-                    "critical"
-                )
-                return
-
             message_id = data.get("message_id", str(uuid.uuid4()))
-
             cur.execute(
                 """
                 INSERT INTO Commands (
@@ -489,6 +590,9 @@ class MQTTService:
             )
             conn.commit()
             logger.info(f"Inserted command for device {device_serial} on topic {topic}")
+            # Add command to cache for timeout tracking
+            with self.command_lock:
+                self.command_cache[(device_serial, data["opId"])] = (topic, datetime.now(timezone.utc))
         except Exception as e:
             logger.error(f"Database error for device {device_serial}: {e}")
             conn.rollback()
@@ -500,9 +604,7 @@ class MQTTService:
         finally:
             cur.close()
             self.release_db(conn)
-    
 
-    logger = logging.getLogger(__name__)
 
     def insert_device_data(self, device_serial: str, topic: str, data: Dict[str, Any]) -> None:
         """Insert device data into the device_data table"""
@@ -522,9 +624,6 @@ class MQTTService:
                     "warning"
                 )
                 return
-
-            # Insert into Devices if not exists
-            logger.debug(f"Inserting device {device_serial} into Devices table")
             cur.execute(
                 """
                 INSERT INTO Devices (serial, mqtt_broker_url)
@@ -533,8 +632,6 @@ class MQTTService:
                 """,
                 (device_serial[:50], "mqtts://mqtt.locacoeur.com:8883")
             )
-
-            # Handle different event types
             if topic.endswith("/event/location"):
                 latitude = data.get("latitude")
                 longitude = data.get("longitude")
@@ -615,8 +712,6 @@ class MQTTService:
                             f"led_power={led_power}, led_defibrillator={led_defibrillator}, "
                             f"led_monitoring={led_monitoring}, led_assistance={led_assistance}, "
                             f"led_mqtt={led_mqtt}, led_environmental={led_environmental}")
-                
-                # FIXED: Added the missing 13th placeholder (%s) to match 13 parameters
                 cur.execute(
                     """
                     INSERT INTO device_data (
@@ -642,8 +737,6 @@ class MQTTService:
                         payload_str
                     )
                 )
-                
-                # Update LEDs table for non-None values
                 led_values = [
                     ("Power", led_power),
                     ("Defibrillator", led_defibrillator),
@@ -665,8 +758,6 @@ class MQTTService:
                             (device_serial[:50], led_type, status, None, datetime.now())
                         )
                         logger.debug(f"Inserted LED: device={device_serial}, type={led_type}, status={status}")
-                
-                # Check for critical conditions
                 if battery is not None and battery < 20:
                     self.send_alert_email(
                         "Low Battery",
@@ -715,10 +806,8 @@ class MQTTService:
                     f"Alert for device {device_serial}: {alert_message}",
                     "critical"
                 )
-            
             conn.commit()
             logger.info(f"Inserted into device_data for device {device_serial} on topic {topic}")
-            
         except Exception as e:
             logger.error(f"Database error for device {device_serial}: {e}")
             conn.rollback()
@@ -727,11 +816,10 @@ class MQTTService:
                 f"Failed to insert device data for device {device_serial} on topic {topic}: {e}",
                 "critical"
             )
-            return
         finally:
             cur.close()
             self.release_db(conn)
-        
+
     def insert_version_data(self, device_serial: str, topic: str, data: Dict[str, Any]) -> None:
         """Insert version data into the Events table"""
         conn = self.connect_db()
@@ -745,14 +833,18 @@ class MQTTService:
                 logger.error(f"Failed to get server_id for device {device_serial}")
                 return
             payload_str = json.dumps(data, sort_keys=True)
-            timestamp = self.parse_timestamp(data.get("timestamp"), device_serial, return_unix=False)
-            if timestamp is None:
-                logger.error(f"Invalid timestamp for device {device_serial} on topic {topic}")
+            timestamp = data.get("timestamp")
+            if not isinstance(timestamp, int) or timestamp < 0 or timestamp > 2**32-1:
+                logger.error(f"Invalid timestamp for device {device_serial}: {timestamp}")
                 self.send_alert_email(
                     "Invalid Timestamp",
-                    f"Invalid timestamp for device {device_serial} on topic {topic}: {data.get('timestamp')}",
+                    f"Invalid timestamp for device {device_serial} on topic {topic}: {timestamp}",
                     "warning"
                 )
+                return
+            timestamp = self.parse_timestamp(timestamp, device_serial, return_unix=False)
+            if timestamp is None:
+                logger.error(f"Invalid parsed timestamp for device {device_serial} on topic {topic}")
                 return
             version = data.get("version")
             if not isinstance(version, str):
@@ -785,7 +877,7 @@ class MQTTService:
                     payload_str,
                     timestamp,
                     datetime.now(),
-                    data.get("timestamp")
+                    str(data.get("timestamp"))
                 )
             )
             conn.commit()
@@ -798,12 +890,11 @@ class MQTTService:
                 f"Failed to insert version data for device {device_serial} on topic {topic}: {e}",
                 "critical"
             )
-            return
         finally:
             cur.close()
             self.release_db(conn)
 
-    def insert_log_data(self, device_serial: str, topic: str, data: Dict[str, Any]) -> None:
+    def insert_log_data(self, device_serial: str, topic: str, data: Any) -> None:
         """Insert log data into the Events table"""
         conn = self.connect_db()
         if not conn:
@@ -815,26 +906,34 @@ class MQTTService:
             if server_id is None:
                 logger.error(f"Failed to get server_id for device {device_serial}")
                 return
-            payload_str = json.dumps(data, sort_keys=True)
-            timestamp = self.parse_timestamp(data.get("timestamp"), device_serial, return_unix=False)
-            if timestamp is None:
-                logger.error(f"Invalid timestamp for device {device_serial} on topic {topic}")
-                self.send_alert_email(
-                    "Invalid Timestamp",
-                    f"Invalid timestamp for device {device_serial} on topic {topic}: {data.get('timestamp')}",
-                    "warning"
-                )
-                return
-            log_message = data.get("log_message")
-            if not isinstance(log_message, str):
-                logger.error(f"Invalid log_message for device {device_serial}: {log_message}")
+            timestamp = None
+            payload_str = data if isinstance(data, str) else json.dumps(data, sort_keys=True)
+            if isinstance(data, dict):
+                timestamp = data.get("timestamp")
+                if not isinstance(timestamp, int) or timestamp < 0 or timestamp > 2**32-1:
+                    logger.error(f"Invalid timestamp for device {device_serial}: {timestamp}")
+                    self.send_alert_email(
+                        "Invalid Timestamp",
+                        f"Invalid timestamp for device {device_serial} on topic {topic}: {timestamp}",
+                        "warning"
+                    )
+                    return
+                timestamp = self.parse_timestamp(timestamp, device_serial, return_unix=False)
+                if timestamp is None:
+                    logger.error(f"Invalid parsed timestamp for device {device_serial} on topic {topic}")
+                    return
+            else:
+                timestamp = datetime.now(timezone.utc)
+                logger.debug(f"Using current time as timestamp for string log payload from {device_serial}")
+            if not isinstance(data, (str, dict)):
+                logger.error(f"Invalid log payload for device {device_serial}: {data}")
                 self.send_alert_email(
                     "Invalid Log Data",
-                    f"Invalid log_message for device {device_serial}: {log_message}",
+                    f"Invalid log payload for device {device_serial}: {data}",
                     "warning"
                 )
                 return
-            logger.debug(f"Inserting log event for {device_serial}: log_message={log_message}")
+            logger.debug(f"Inserting log event for {device_serial}: payload={payload_str}")
             cur.execute(
                 """
                 INSERT INTO Events (
@@ -856,7 +955,7 @@ class MQTTService:
                     payload_str,
                     timestamp,
                     datetime.now(),
-                    data.get("timestamp")
+                    str(data.get("timestamp")) if isinstance(data, dict) else None
                 )
             )
             conn.commit()
@@ -869,7 +968,6 @@ class MQTTService:
                 f"Failed to insert log data for device {device_serial} on topic {topic}: {e}",
                 "critical"
             )
-            return
         finally:
             cur.close()
             self.release_db(conn)
@@ -882,10 +980,9 @@ class MQTTService:
         try:
             cur = conn.cursor()
             payload_str = json.dumps(data, sort_keys=True)
-            result_status = data.get("status", "")[:50]  # Truncate to 50 chars
+            result_status = str(data.get("result", ""))[:50]  # Store as string to handle integer codes
             result_message = data.get("message", "")
             timestamp = self.parse_timestamp(data.get("timestamp"), device_serial)
-
             if timestamp is None:
                 logger.error(f"Invalid timestamp for device {device_serial} on topic {topic}")
                 self.send_alert_email(
@@ -894,8 +991,14 @@ class MQTTService:
                     "warning"
                 )
                 return
-
-            # Insert into Devices if not exists
+            if "opId" not in data:
+                logger.error(f"Missing opId in result payload for {device_serial} on topic {topic}")
+                self.send_alert_email(
+                    "Invalid Result Payload",
+                    f"Missing opId in result for {device_serial} on topic {topic}",
+                    "warning"
+                )
+                return
             cur.execute(
                 """
                 INSERT INTO Devices (serial, mqtt_broker_url)
@@ -904,21 +1007,18 @@ class MQTTService:
                 """,
                 (device_serial[:50], "mqtts://mqtt.locacoeur.com:8883")
             )
-
-            # Find the corresponding command_id (if any)
             command_id = None
-            if "command_id" in data:
+            if "opId" in data:
                 cur.execute(
                     """
                     SELECT command_id FROM Commands
-                    WHERE device_serial = %s AND command_id = %s
+                    WHERE device_serial = %s AND payload->>'opId' = %s
+                    ORDER BY created_at DESC LIMIT 1
                     """,
-                    (device_serial[:50], data["command_id"])
+                    (device_serial[:50], data["opId"])
                 )
                 result = cur.fetchone()
                 command_id = result[0] if result else None
-
-            # Insert into Results
             cur.execute(
                 """
                 INSERT INTO Results (
@@ -934,11 +1034,25 @@ class MQTTService:
                     result_status,
                     result_message,
                     payload_str,
-                    datetime.now()  # TIMESTAMP WITHOUT TIME ZONE
+                    datetime.now()
                 )
             )
             conn.commit()
-            logger.info(f"Inserted result for device {device_serial} on topic {topic}")
+            if command_id and "update" in topic.lower() or (result_message and "update" in result_message.lower()):
+                result_codes = {
+                    "0": "Success",
+                    "-1": "Missing opId",
+                    "-2": "Null object reference",
+                    "-3": "Audio file not found"
+                }
+                result_desc = result_codes.get(result_status, f"Unknown result code: {result_status}")
+                logger.info(f"Firmware update result for {device_serial}: status={result_desc}, message={result_message}")
+                if result_status != "0":
+                    self.send_alert_email(
+                        "Firmware Update Result",
+                        f"Firmware update for {device_serial} failed: {result_desc} - {result_message}",
+                        "critical"
+                    )
         except Exception as e:
             logger.error(f"Database error for device {device_serial}: {e}")
             conn.rollback()
@@ -964,7 +1078,6 @@ class MQTTService:
             operation_id = topic_parts[3] if len(topic_parts) > 3 else None
             payload_str = json.dumps(data, sort_keys=True)
 
-            # Validate payload based on operation
             if topic_category == "event":
                 if operation_id == "location" and not all(key in data for key in ["latitude", "longitude"]):
                     logger.error(f"Invalid location payload for {device_serial}: {data}")
@@ -974,11 +1087,11 @@ class MQTTService:
                         "warning"
                     )
                     return
-                elif operation_id == "version" and "firmware_version" not in data:
+                elif operation_id == "version" and "version" not in data:
                     logger.error(f"Invalid version payload for {device_serial}: {data}")
                     self.send_alert_email(
                         "Invalid Payload",
-                        f"Version event missing firmware_version for {device_serial}: {data}",
+                        f"Version event missing version for {device_serial}: {data}",
                         "warning"
                     )
                     return
@@ -998,8 +1111,9 @@ class MQTTService:
                         "warning"
                     )
                     return
+                if operation_id == "config":
+                    self.insert_config_data(device_serial, topic, payload)
 
-            # Handle alert follow-ups
             if topic_category == "event" and operation_id in ["status", "location"]:
                 if device_serial in self.alert_cache:
                     logger.info(f"Processing follow-up {operation_id} for alert on {device_serial}")
@@ -1010,12 +1124,10 @@ class MQTTService:
                         "warning"
                     )
 
-            # Get server_id
             cur.execute("SELECT server_id FROM Servers WHERE environment = %s", ("production",))
             result = cur.fetchone()
             server_id = result[0] if result else 1
 
-            # Ensure device exists
             cur.execute(
                 """
                 INSERT INTO Devices (serial, mqtt_broker_url)
@@ -1025,7 +1137,6 @@ class MQTTService:
                 (device_serial, "mqtts://mqtt.locacoeur.com:8883")
             )
 
-            # Handle Events
             if topic_category == "event":
                 cur.execute(
                     """
@@ -1051,7 +1162,6 @@ class MQTTService:
                     )
                 )
 
-                # Update LEDs
                 led_updates = {}
                 alert_id = data.get("id") if operation_id == "Alert" else None
                 if alert_id == 2:
@@ -1101,7 +1211,6 @@ class MQTTService:
                         (device_serial, led_type, status, description, datetime.now(timezone.utc))
                     )
 
-            # Handle Commands
             elif topic_category == "command":
                 is_get = len(topic_parts) > 4 and topic_parts[4] == "get"
                 cur.execute(
@@ -1123,9 +1232,8 @@ class MQTTService:
                     )
                 )
 
-            # Handle Results
             elif topic_category == "result":
-                result_status = data.get("status", "Success")
+                result_status = str(data.get("result", ""))[:50]
                 result_message = data.get("message")
                 cur.execute(
                     """
@@ -1154,7 +1262,6 @@ class MQTTService:
                     )
                 )
 
-            # Check critical alerts
             if topic_category == "event":
                 self.detect_critical_alerts(device_serial, topic, data)
                 self.insert_device_data(device_serial, topic, data)
@@ -1170,6 +1277,193 @@ class MQTTService:
             self.send_alert_email(
                 "Database Error",
                 f"Failed to insert data for device {device_serial} on topic {topic}: {e}",
+                "critical"
+            )
+        finally:
+            cur.close()
+            self.release_db(conn)
+
+    def request_config(self, device_serial: str) -> None:
+        """Request the current device configuration."""
+        try:
+            op_id = str(uuid.uuid4())
+            topic = f"LC1/{device_serial}/command/config/get"
+            payload = {"opId": op_id}
+            self.client.publish(topic, json.dumps(payload), qos=0)
+            logger.info(f"Sent config request to {topic} with opId {op_id}")
+        except Exception as e:
+            logger.error(f"Failed to send config request for {device_serial}: {e}")
+            self.send_alert_email(
+                "Config Request Failed",
+                f"Failed to send config request for device {device_serial}: {e}",
+                "warning"
+            )
+
+    def set_config(self, device_serial: str, config: Dict[str, Any]) -> None:
+        """Set device configuration."""
+        try:
+            op_id = str(uuid.uuid4())
+            topic = f"LC1/{device_serial}/command/config"
+            payload = {"opId": op_id, "config": config}
+            self.client.publish(topic, json.dumps(payload), qos=0)
+            logger.info(f"Sent config update to {topic} with opId {op_id}")
+        except Exception as e:
+            logger.error(f"Failed to send config update for {device_serial}: {e}")
+            self.send_alert_email(
+                "Config Update Failed",
+                f"Failed to send config update for device {device_serial}: {e}",
+                "critical"
+            )
+    def request_location(self, device_serial: str) -> None:
+        """Request the current device location."""
+        try:
+            op_id = str(uuid.uuid4())
+            topic = f"LC1/{device_serial}/command/location"
+            payload = {"opId": op_id}
+            self.client.publish(topic, json.dumps(payload), qos=0)
+            logger.info(f"Sent location request to {topic} with opId {op_id}")
+        except Exception as e:
+            logger.error(f"Failed to send location request for {device_serial}: {e}")
+            self.send_alert_email(
+                "Location Request Failed",
+                f"Failed to send location request for device {device_serial}: {e}",
+                "warning"
+            )
+
+    def request_log(self, device_serial: str) -> None:
+        try:
+            op_id = str(uuid.uuid4())  # Keep op_id for logging, but don't send in payload
+            topic = f"LC1/{device_serial}/command/log"
+            payload = {}
+            self.client.publish(topic, json.dumps(payload), qos=0)
+            logger.info(f"Sent log request to {topic} with opId {op_id}")
+        except Exception as e:
+            logger.error(f"Failed to send log request for {device_serial}: {e}")
+            self.send_alert_email(
+                "Log Request Failed",
+                f"Failed to send log request for device {device_serial}: {e}",
+                "warning"
+            )
+            
+    def play_audio(self, device_serial: str, audio_message: str) -> None:
+        """Send audio playback command."""
+        valid_messages = ["message_1", "message_2"]
+        if audio_message not in valid_messages:
+            logger.error(f"Invalid audio message for {device_serial}: {audio_message}")
+            self.send_alert_email(
+                "Invalid Audio Message",
+                f"Invalid audio message for device {device_serial}: {audio_message}",
+                "warning"
+            )
+            return
+        try:
+            op_id = str(uuid.uuid4())
+            topic = f"LC1/{device_serial}/command/play"
+            payload = {"opId": op_id, "audioMessage": audio_message}
+            self.client.publish(topic, json.dumps(payload), qos=0)
+            logger.info(f"Sent audio play command to {topic} with opId {op_id}")
+        except Exception as e:
+            logger.error(f"Failed to send audio play command for {device_serial}: {e}")
+            self.send_alert_email(
+                "Audio Play Command Failed",
+                f"Failed to send audio play command for device {device_serial}: {e}",
+                "critical"
+            )
+    def insert_config_data(self, device_serial: str, topic: str, data: Dict[str, Any]) -> None:
+        """Insert config data into the Events table"""
+        conn = self.connect_db()
+        if not conn:
+            logger.error("Failed to connect to database")
+            return
+        try:
+            cur = conn.cursor()
+            server_id = self.get_server_id()
+            if server_id is None:
+                logger.error(f"Failed to get server_id for device {device_serial}")
+                return
+            payload_str = json.dumps(data, sort_keys=True)
+            timestamp = data.get("timestamp")
+            if not isinstance(timestamp, int) or timestamp < 0 or timestamp > 2**32-1:
+                logger.error(f"Invalid timestamp for device {device_serial}: {timestamp}")
+                self.send_alert_email(
+                    "Invalid Timestamp",
+                    f"Invalid timestamp for device {device_serial} on topic {topic}: {timestamp}",
+                    "warning"
+                )
+                return
+            timestamp = self.parse_timestamp(timestamp, device_serial, return_unix=False)
+            if timestamp is None:
+                logger.error(f"Invalid parsed timestamp for device {device_serial} on topic {topic}")
+                return
+            config = data.get("config")
+            if not isinstance(config, dict):
+                logger.error(f"Invalid config for device {device_serial}: {config}")
+                self.send_alert_email(
+                    "Invalid Config Data",
+                    f"Invalid config for device {device_serial}: {config}",
+                    "warning"
+                )
+                return
+            for field in ["report_interval", "license_paid"]:
+                if field not in config:
+                    logger.warning(f"Missing config field {field} for device {device_serial}")
+            if "phones" in config and not isinstance(config["phones"], list):
+                logger.error(f"Invalid phones format for device {device_serial}: {config['phones']}")
+                self.send_alert_email(
+                    "Invalid Config Data",
+                    f"Invalid phones format for device {device_serial}: {config['phones']}",
+                    "warning"
+                )
+                return
+            if "emails" in config and not isinstance(config["emails"], list):
+                logger.error(f"Invalid emails format for device {device_serial}: {config['emails']}")
+                self.send_alert_email(
+                    "Invalid Config Data",
+                    f"Invalid emails format for device {device_serial}: {config['emails']}",
+                    "warning"
+                )
+                return
+            if "services" in config and not isinstance(config["services"], dict):
+                logger.error(f"Invalid services format for device {device_serial}: {config['services']}")
+                self.send_alert_email(
+                    "Invalid Config Data",
+                    f"Invalid services format for device {device_serial}: {config['services']}",
+                    "warning"
+                )
+                return
+            logger.debug(f"Inserting config event for {device_serial}: config={config}")
+            cur.execute(
+                """
+                INSERT INTO Events (
+                    device_serial, server_id, operation_id, topic, payload,
+                    event_timestamp, created_at, original_timestamp
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (device_serial, topic, event_timestamp)
+                DO UPDATE SET
+                    payload = EXCLUDED.payload,
+                    created_at = EXCLUDED.created_at,
+                    original_timestamp = EXCLUDED.original_timestamp
+                """,
+                (
+                    device_serial[:50],
+                    server_id,
+                    "config",
+                    topic[:255],
+                    payload_str,
+                    timestamp,
+                    datetime.now(),
+                    str(data.get("timestamp"))
+                )
+            )
+            conn.commit()
+            logger.info(f"Inserted config data for device {device_serial} on topic {topic}")
+        except Exception as e:
+            logger.error(f"Database error for device {device_serial}: {e}")
+            conn.rollback()
+            self.send_alert_email(
+                "Database Error",
+                f"Failed to insert config data for device {device_serial} on topic {topic}: {e}",
                 "critical"
             )
         finally:
@@ -1208,7 +1502,7 @@ class MQTTService:
                 elif event_type == "version":
                     self.insert_version_data(device_serial, topic, payload)
                 elif event_type == "log":
-                    self.insert_log_data(device_serial, topic, payload)
+                    self.insert_log_data(device_serial, topic, msg.payload.decode("utf-8"))
             elif operation == "command":
                 self.insert_command(device_serial, topic, payload)
             elif operation == "result":
@@ -1234,8 +1528,7 @@ class MQTTService:
         """MQTT log callback"""
         logger.debug(f"MQTT log: {buf}")
 
-    def connect_with_retry(self, max_retries=10, retry_delay=5, max_total_attempts=50):
-        """Connect to MQTT broker with retry logic"""
+    def connect_with_retry(self, max_retries=10, retry_delay=10, max_total_attempts=50):
         total_attempts = 0
         while self.running and total_attempts < max_total_attempts:
             for attempt in range(max_retries):
@@ -1279,9 +1572,8 @@ class MQTTService:
         self.client.on_log = self.on_log
 
     def run(self):
-        """Main service loop"""
         logger.info("Starting LOCACOEUR MQTT service...")
-        threading.Timer(86400, self.backup_device_data).start()  # Daily backup
+        threading.Timer(86400, self.backup_device_data).start()
         connected = False
         while self.running and not connected:
             connected = self.connect_with_retry()
@@ -1296,21 +1588,39 @@ class MQTTService:
         try:
             self.client.loop_start()
             while self.running:
-                if not self.client.is_connected():
-                    logger.warning("MQTT connection lost, attempting to reconnect...")
-                    self.client.loop_stop()
-                    connected = False
-                    while self.running and not connected:
-                        connected = self.connect_with_retry()
-                        if not connected:
-                            time.sleep(30)
-                    if connected:
-                        self.client.loop_start()
+                try:
+                    if not self.client.is_connected():
+                        logger.warning("MQTT connection lost, attempting to reconnect...")
+                        try:
+                            self.client.loop_stop()
+                        except Exception as e:
+                            logger.warning(f"Error stopping MQTT loop: {e}")
+                        connected = False
+                        while self.running and not connected:
+                            connected = self.connect_with_retry()
+                            if not connected:
+                                time.sleep(30)
+                        if connected:
+                            try:
+                                self.client.loop_start()
+                            except Exception as e:
+                                logger.error(f"Error restarting MQTT loop: {e}")
+                except Exception as e:
+                    logger.error(f"Error checking MQTT connection: {e}")
                 time.sleep(1)
+        except Exception as e:
+            logger.error(f"Main loop crashed: {e}")
+            self.send_alert_email("Main Loop Crashed", f"Main loop crashed with error: {e}", "critical")
         finally:
-            self.client.loop_stop()
-            self.client.disconnect()
-            self.db_pool.closeall()
+            try:
+                self.client.loop_stop()
+                self.client.disconnect()
+            except Exception as e:
+                logger.warning(f"Error during final MQTT cleanup: {e}")
+            try:
+                self.db_pool.closeall()
+            except Exception as e:
+                logger.warning(f"Error closing database pool: {e}")
         logger.info("LOCACOEUR MQTT service stopped")
         return True
 
