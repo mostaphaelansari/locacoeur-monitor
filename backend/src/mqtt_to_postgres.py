@@ -1144,53 +1144,182 @@ class MQTTService:
         if not conn:
             logger.error("Failed to connect to database")
             return
-        cur = conn.cursor()
         try:
             cur = conn.cursor()
-            parsed_timestamp = self.parse_timestamp(data.get("timestamp"), device_serial)
+            device_serial = payload.get("device_serial")
+            timestamp = payload.get("timestamp")
+            if not all([device_serial, timestamp]):
+                logger.error(f"Missing device_serial or timestamp in payload: {payload}")
+                self.send_alert_email(
+                    "Invalid Payload",
+                    f"Missing device_serial or timestamp in payload for topic {topic}: {payload}",
+                    "warning"
+                )
+                return
+
+            parsed_timestamp = self.parse_timestamp(timestamp, device_serial, return_unix=True)
+            if parsed_timestamp is None:
+                logger.error(f"Invalid timestamp for topic {topic}: {timestamp}")
+                self.send_alert_email(
+                    "Invalid Timestamp",
+                    f"Invalid timestamp for topic {topic}: {timestamp}",
+                    "warning"
+                )
+                return
+
             topic_parts = topic.split("/")
             topic_category = topic_parts[2] if len(topic_parts) > 2 else None
             operation_id = topic_parts[3] if len(topic_parts) > 3 else None
-            payload_str = json.dumps(data, sort_keys=True)
+            payload_str = json.dumps(payload, sort_keys=True)
+
+            # Insert into Devices
+            try:
+                cur.execute(
+                    """
+                    INSERT INTO Devices (serial, mqtt_broker_url)
+                    VALUES (%s, %s)
+                    ON CONFLICT (serial) DO NOTHING
+                    """,
+                    (device_serial[:50], "mqtts://mqtt.locacoeur.com:8883")
+                )
+            except psycopg2.errors.UniqueViolation:
+                logger.debug(f"Duplicate device record skipped for {device_serial}")
+                conn.rollback()
+                cur = conn.cursor()
+            except Exception as e:
+                logger.error(f"Error inserting into Devices for {device_serial}: {e}")
+                conn.rollback()
+                self.send_alert_email(
+                    "Database Error",
+                    f"Failed to insert into Devices for {device_serial}: {e}",
+                    "critical"
+                )
+                return
 
             # Validate payload based on operation
             if topic_category == "event":
-                if operation_id == "location" and not all(key in data for key in ["latitude", "longitude"]):
-                    logger.error(f"Invalid location payload for {device_serial}: {data}")
-                    self.send_alert_email(
-                        "Invalid Payload",
-                        f"Location event missing latitude/longitude for {device_serial}: {data}",
-                        "warning"
-                    )
-                    return
-                elif operation_id == "version" and "firmware_version" not in data:
-                    logger.error(f"Invalid version payload for {device_serial}: {data}")
-                    self.send_alert_email(
-                        "Invalid Payload",
-                        f"Version event missing firmware_version for {device_serial}: {data}",
-                        "warning"
-                    )
-                    return
-                elif operation_id == "status" and not any(key in data for key in ["led_power", "led_defibrillator", "led_monitoring", "led_assistance", "led_mqtt", "led_environmental"]):
-                    logger.error(f"Invalid status payload for {device_serial}: {data}")
-                    self.send_alert_email(
-                        "Invalid Payload",
-                        f"Status event missing LED data for {device_serial}: {data}",
-                        "warning"
-                    )
-                    return
-                elif operation_id == "alert" and "message" not in data:
-                    logger.error(f"Invalid alert payload for {device_serial}: {data}")
-                    self.send_alert_email(
-                        "Invalid Payload",
-                        f"Alert event missing message for {device_serial}: {data}",
-                        "warning"
-                    )
-                    return
-
-            elif event_type == "alert":
-                code = event.get("code")
-                if code:
+                event = payload.get("event", {})
+                if operation_id == "location":
+                    if not all(key in event for key in ["latitude", "longitude"]):
+                        logger.error(f"Invalid location payload for {device_serial}: {payload}")
+                        self.send_alert_email(
+                            "Invalid Payload",
+                            f"Location event missing latitude/longitude for {device_serial}: {payload}",
+                            "warning"
+                        )
+                        return
+                    try:
+                        cur.execute(
+                            """
+                            INSERT INTO Locations (device_serial, timestamp, latitude, longitude)
+                            VALUES (%s, %s, %s, %s)
+                            ON CONFLICT (device_serial, timestamp) DO NOTHING
+                            """,
+                            (
+                                device_serial[:50],
+                                parsed_timestamp,
+                                float(event["latitude"]),
+                                float(event["longitude"])
+                            )
+                        )
+                    except Exception as e:
+                        logger.error(f"Error inserting into Locations for {device_serial}: {e}")
+                        conn.rollback()
+                        self.send_alert_email(
+                            "Database Error",
+                            f"Failed to insert into Locations for {device_serial}: {e}",
+                            "critical"
+                        )
+                        return
+                elif operation_id == "version":
+                    if "firmware" not in event:
+                        logger.error(f"Invalid version payload for {device_serial}: {payload}")
+                        self.send_alert_email(
+                            "Invalid Payload",
+                            f"Version event missing firmware for {device_serial}: {payload}",
+                            "warning"
+                        )
+                        return
+                    try:
+                        cur.execute(
+                            """
+                            INSERT INTO Versions (device_serial, timestamp, version)
+                            VALUES (%s, %s, %s)
+                            ON CONFLICT (device_serial, timestamp) DO UPDATE SET version = EXCLUDED.version
+                            """,
+                            (
+                                device_serial[:50],
+                                parsed_timestamp,
+                                event["firmware"][:50]
+                            )
+                        )
+                    except Exception as e:
+                        logger.error(f"Error inserting into Versions for {device_serial}: {e}")
+                        conn.rollback()
+                        self.send_alert_email(
+                            "Database Error",
+                            f"Failed to insert into Versions for {device_serial}: {e}",
+                            "critical"
+                        )
+                        return
+                elif operation_id == "status":
+                    if not event.get("leds"):
+                        logger.error(f"Invalid status payload for {device_serial}: {payload}")
+                        self.send_alert_email(
+                            "Invalid Payload",
+                            f"Status event missing LED data for {device_serial}: {payload}",
+                            "warning"
+                        )
+                        return
+                    try:
+                        cur.execute(
+                            """
+                            INSERT INTO Status (device_serial, timestamp, state)
+                            VALUES (%s, %s, %s)
+                            ON CONFLICT (device_serial, timestamp) DO NOTHING
+                            """,
+                            (
+                                device_serial[:50],
+                                parsed_timestamp,
+                                event.get("state", "")[:50]
+                            )
+                        )
+                        for led in event.get("leds", []):
+                            led_type = led.get("type")
+                            status = led.get("state")
+                            if led_type and status in {"Green", "Red", "Off"}:
+                                cur.execute(
+                                    """
+                                    INSERT INTO LEDs (device_serial, led_type, status, last_updated)
+                                    VALUES (%s, %s, %s, CURRENT_TIMESTAMP)
+                                    ON CONFLICT (device_serial, led_type)
+                                    DO UPDATE SET status = EXCLUDED.status, last_updated = CURRENT_TIMESTAMP
+                                    """,
+                                    (
+                                        device_serial[:50],
+                                        led_type[:50],
+                                        status[:50]
+                                    )
+                                )
+                    except Exception as e:
+                        logger.error(f"Error inserting into Status or LEDs for {device_serial}: {e}")
+                        conn.rollback()
+                        self.send_alert_email(
+                            "Database Error",
+                            f"Failed to insert into Status or LEDs for {device_serial}: {e}",
+                            "critical"
+                        )
+                        return
+                elif operation_id == "alert":
+                    code = event.get("code")
+                    if not code:
+                        logger.error(f"Invalid alert payload for {device_serial}: {payload}")
+                        self.send_alert_email(
+                            "Invalid Payload",
+                            f"Alert event missing code for {device_serial}: {payload}",
+                            "warning"
+                        )
+                        return
                     cache_key = f"{device_serial}:{code}"
                     if cache_key not in self.alert_cache:
                         self.alert_cache[cache_key] = True
@@ -1206,7 +1335,11 @@ class MQTTService:
                             VALUES (%s, %s, %s)
                             ON CONFLICT (device_serial, timestamp, code) DO NOTHING
                             """,
-                            (device_serial[:50], timestamp, code[:50])
+                            (
+                                device_serial[:50],
+                                parsed_timestamp,
+                                code[:50]
+                            )
                         )
                     except Exception as e:
                         logger.error(f"Error inserting into Alerts for {device_serial}: {e}")
@@ -1280,6 +1413,46 @@ class MQTTService:
                             "critical"
                         )
                         return
+
+            # Insert into Events for all valid messages
+            try:
+                server_id = self.get_server_id()
+                if server_id is None:
+                    logger.error(f"Failed to get server_id for device {device_serial}")
+                    return
+                cur.execute(
+                    """
+                    INSERT INTO Events (
+                        device_serial, server_id, operation_id, topic, payload,
+                        event_timestamp, created_at, original_timestamp
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (device_serial, topic, event_timestamp)
+                    DO UPDATE SET
+                        payload = EXCLUDED.payload,
+                        created_at = EXCLUDED.created_at,
+                        original_timestamp = EXCLUDED.original_timestamp
+                    """,
+                    (
+                        device_serial[:50],
+                        server_id,
+                        operation_id[:50] if operation_id else None,
+                        topic[:255],
+                        payload_str,
+                        parsed_timestamp,
+                        datetime.now(),
+                        str(timestamp)
+                    )
+                )
+            except Exception as e:
+                logger.error(f"Error inserting into Events for {device_serial}: {e}")
+                conn.rollback()
+                self.send_alert_email(
+                    "Database Error",
+                    f"Failed to insert into Events for {device_serial}: {e}",
+                    "critical"
+                )
+                return
 
             conn.commit()
             logger.info(f"Data processed for device {device_serial} from topic {topic}")
