@@ -731,9 +731,9 @@ class MQTTService:
                     """
                     INSERT INTO device_data (
                         device_serial, topic, latitude, longitude, timestamp,
-                        original_timestamp, received_at, payload
+                        original_timestamp, payload
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
                     """,
                     (
                         device_serial[:50],
@@ -742,7 +742,6 @@ class MQTTService:
                         float(longitude),
                         timestamp,
                         timestamp,
-                        datetime.now(),
                         payload_str
                     )
                 )
@@ -750,12 +749,23 @@ class MQTTService:
             # Handle status events
             elif topic.endswith("/event/status"):
                 battery = data.get("battery")
+                connection = data.get("connection")
+                defibrillator = data.get("defibrillator")
+                power_source = data.get("power_source")
                 led_power = data.get("led_power")
                 led_defibrillator = data.get("led_defibrillator")
                 led_monitoring = data.get("led_monitoring")
                 led_assistance = data.get("led_assistance")
                 led_mqtt = data.get("led_mqtt")
                 led_environmental = data.get("led_environmental")
+                
+                # Handle nested location data if present
+                latitude = None
+                longitude = None
+                location_data = data.get("location")
+                if location_data and isinstance(location_data, dict):
+                    latitude = location_data.get("latitude")
+                    longitude = location_data.get("longitude")
                 
                 logger.debug(f"Processing status event for {device_serial}: battery={battery}, "
                             f"led_power={led_power}, led_defibrillator={led_defibrillator}, "
@@ -771,6 +781,25 @@ class MQTTService:
                         "warning"
                     )
                     return
+                
+                # Validate defibrillator value
+                if defibrillator is not None and (not isinstance(defibrillator, int) or defibrillator < 0):
+                    logger.error(f"Invalid defibrillator value for device {device_serial}: {defibrillator}")
+                    self.send_alert_email(
+                        "Invalid Status Data",
+                        f"Invalid defibrillator value for device {device_serial}: {defibrillator}",
+                        "warning"
+                    )
+                    return
+                
+                # Validate location if present
+                if latitude is not None and longitude is not None:
+                    if not isinstance(latitude, (int, float)) or not isinstance(longitude, (int, float)):
+                        logger.error(f"Invalid location data types for device {device_serial}: latitude={latitude}, longitude={longitude}")
+                        latitude = longitude = None
+                    elif not (-90 <= latitude <= 90) or not (-180 <= longitude <= 180):
+                        logger.error(f"Invalid location data for device {device_serial}: latitude={latitude}, longitude={longitude}")
+                        latitude = longitude = None
                 
                 # Validate LED values
                 valid_leds = {"Green", "Red", "Off"}
@@ -795,16 +824,21 @@ class MQTTService:
                 cur.execute(
                     """
                     INSERT INTO device_data (
-                        device_serial, topic, battery, led_power, led_defibrillator,
-                        led_monitoring, led_assistance, led_mqtt, led_environmental,
-                        timestamp, original_timestamp, received_at, payload
+                        device_serial, topic, battery, connection, defibrillator, latitude, longitude,
+                        power_source, led_power, led_defibrillator, led_monitoring, led_assistance, 
+                        led_mqtt, led_environmental, timestamp, original_timestamp, payload
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """,
                     (
                         device_serial[:50],
                         topic[:255],
                         battery,
+                        connection[:50] if connection else None,
+                        defibrillator,
+                        float(latitude) if latitude is not None else None,
+                        float(longitude) if longitude is not None else None,
+                        power_source[:50] if power_source else None,
                         led_power if led_power else None,
                         led_defibrillator if led_defibrillator else None,
                         led_monitoring if led_monitoring else None,
@@ -813,7 +847,6 @@ class MQTTService:
                         led_environmental if led_environmental else None,
                         timestamp,
                         timestamp,
-                        datetime.now(),
                         payload_str
                     )
                 )
@@ -830,7 +863,7 @@ class MQTTService:
                 
                 for led_type, status in led_values:
                     if status is not None:
-                        logger.debug(f"Inserting LED: device={device_serial}, type={led_type}, status={status}")
+                        logger.debug(f"Updating LED: device={device_serial}, type={led_type}, status={status}")
                         cur.execute(
                             """
                             INSERT INTO LEDs (device_serial, led_type, status, description, last_updated)
@@ -840,9 +873,7 @@ class MQTTService:
                             """,
                             (device_serial[:50], led_type, status, None, datetime.now())
                         )
-                        logger.info(f"Inserted into LEDs for device {device_serial}: type={led_type}, status={status}")
-                    else:
-                        logger.warning(f"Missing LED value for {led_type} on device {device_serial}")
+                        logger.info(f"Updated LED for device {device_serial}: type={led_type}, status={status}")
                 
                 # Send alerts for critical conditions
                 if battery is not None and battery < 20:
@@ -865,7 +896,7 @@ class MQTTService:
                 alert_message = data.get("message")
                 logger.debug(f"Processing alert event for {device_serial}: alert_id={alert_id}, alert_message={alert_message}")
                 
-                if not isinstance(alert_id, int):
+                if alert_id is not None and not isinstance(alert_id, int):
                     logger.error(f"Invalid alert_id for device {device_serial}: {alert_id}")
                     self.send_alert_email(
                         "Invalid Alert Data",
@@ -878,9 +909,9 @@ class MQTTService:
                     """
                     INSERT INTO device_data (
                         device_serial, topic, alert_id, alert_message, timestamp,
-                        original_timestamp, received_at, payload
+                        original_timestamp, payload
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
                     """,
                     (
                         device_serial[:50],
@@ -889,7 +920,6 @@ class MQTTService:
                         alert_message[:255] if alert_message else None,
                         timestamp,
                         timestamp,
-                        datetime.now(),
                         payload_str
                     )
                 )
@@ -898,6 +928,25 @@ class MQTTService:
                     f"Critical Alert - Device {device_serial}",
                     f"Alert for device {device_serial}: {alert_message}",
                     "critical"
+                )
+            
+            # Handle other event types - generic insertion
+            else:
+                logger.debug(f"Processing generic event for {device_serial} on topic {topic}")
+                cur.execute(
+                    """
+                    INSERT INTO device_data (
+                        device_serial, topic, timestamp, original_timestamp, payload
+                    )
+                    VALUES (%s, %s, %s, %s, %s)
+                    """,
+                    (
+                        device_serial[:50],
+                        topic[:255],
+                        timestamp,
+                        timestamp,
+                        payload_str
+                    )
                 )
 
             conn.commit()
