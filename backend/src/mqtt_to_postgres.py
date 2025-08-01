@@ -790,12 +790,12 @@ class MQTTService:
         if not conn:
             logger.error("Failed to connect to database")
             return
-        
+
         try:
             cur = conn.cursor()
             payload_str = json.dumps(data, sort_keys=True)
             timestamp = self.parse_timestamp(data.get("timestamp"), device_serial, return_unix=True)
-            
+
             if timestamp is None:
                 logger.error(f"Invalid timestamp for device {device_serial} on topic {topic}")
                 self.send_alert_email(
@@ -831,43 +831,28 @@ class MQTTService:
 
             # Handle location events
             if topic.endswith("/event/location"):
-                # Direct location event
-                location_data = data.get("location", {})
-                latitude = location_data.get("latitude")
-                longitude = location_data.get("longitude")
-                
+                latitude = data.get("latitude")
+                longitude = data.get("longitude")
                 logger.debug(f"Processing location event for {device_serial}: latitude={latitude}, longitude={longitude}")
-                
-                if latitude is None or longitude is None:
-                    logger.error(f"Missing location data for device {device_serial}: latitude={latitude}, longitude={longitude}")
-                    self.send_alert_email(
-                        "Invalid Location Data",
-                        f"Missing location data for device {device_serial}: latitude={latitude}, longitude={longitude}",
-                        "warning"
-                    )
-                    return
-                
+
                 if not isinstance(latitude, (int, float)) or not isinstance(longitude, (int, float)):
-                    logger.error(f"Invalid location data types for device {device_serial}: latitude={type(latitude)}, longitude={type(longitude)}")
+                    logger.error(f"Invalid location data types for device {device_serial}: latitude={latitude}, longitude={longitude}")
                     self.send_alert_email(
                         "Invalid Location Data",
-                        f"Invalid location data types for device {device_serial}: latitude={type(latitude)}, longitude={type(longitude)}",
+                        f"Invalid location data types for device {device_serial}: latitude={latitude}, longitude={longitude}",
                         "warning"
                     )
                     return
-                
-                latitude = float(latitude)
-                longitude = float(longitude)
-                
+
                 if not (-90 <= latitude <= 90) or not (-180 <= longitude <= 180):
-                    logger.error(f"Invalid location coordinates for device {device_serial}: latitude={latitude}, longitude={longitude}")
+                    logger.error(f"Invalid location data for device {device_serial}: latitude={latitude}, longitude={longitude}")
                     self.send_alert_email(
                         "Invalid Location Data",
-                        f"Invalid location coordinates for device {device_serial}: latitude={latitude}, longitude={longitude}",
+                        f"Invalid location for device {device_serial}: latitude={latitude}, longitude={longitude}",
                         "warning"
                     )
                     return
-                
+
                 cur.execute(
                     """
                     INSERT INTO device_data (
@@ -879,8 +864,8 @@ class MQTTService:
                     (
                         device_serial[:50],
                         topic[:255],
-                        latitude,
-                        longitude,
+                        float(latitude),
+                        float(longitude),
                         timestamp,
                         timestamp,
                         payload_str
@@ -891,55 +876,43 @@ class MQTTService:
             elif topic.endswith("/event/status"):
                 if not self.validate_status_payload(device_serial, topic, data):
                     return
-                
+
                 battery = data.get("battery")
                 connection = data.get("connection")
                 defibrillator = data.get("defibrillator")
                 power_source = data.get("power_source")
-                
+
                 # Process LED states using improved logic
                 led_states = self.process_device_status(device_serial, data)
-                
-                # Handle nested location data if present - FIXED LOGIC
+
+                # Handle nested location data if present
                 latitude = None
                 longitude = None
-                
-                # Check for nested location data in status message
                 location_data = data.get("location")
                 if location_data and isinstance(location_data, dict):
-                    lat_val = location_data.get("latitude")
-                    lon_val = location_data.get("longitude")
-                    
-                    # Validate location data
-                    if lat_val is not None and lon_val is not None:
-                        try:
-                            latitude = float(lat_val)
-                            longitude = float(lon_val)
-                            
-                            # Validate coordinate ranges
-                            if not (-90 <= latitude <= 90) or not (-180 <= longitude <= 180):
-                                logger.warning(f"Invalid location coordinates for device {device_serial}: latitude={latitude}, longitude={longitude}")
-                                latitude = longitude = None
-                            else:
-                                logger.debug(f"Valid location data for device {device_serial}: latitude={latitude}, longitude={longitude}")
-                        except (ValueError, TypeError) as e:
-                            logger.warning(f"Could not convert location data for device {device_serial}: {e}")
-                            latitude = longitude = None
-                    else:
-                        logger.debug(f"No location data in status message for device {device_serial}")
-                
+                    latitude = location_data.get("latitude")
+                    longitude = location_data.get("longitude")
+
+                # Validate location if present
+                if latitude is not None and longitude is not None:
+                    if not isinstance(latitude, (int, float)) or not isinstance(longitude, (int, float)):
+                        logger.error(f"Invalid location data types for device {device_serial}: latitude={latitude}, longitude={longitude}")
+                        latitude = longitude = None
+                    elif not (-90 <= latitude <= 90) or not (-180 <= longitude <= 180):
+                        logger.error(f"Invalid location data for device {device_serial}: latitude={latitude}, longitude={longitude}")
+                        latitude = longitude = None
+
                 logger.debug(f"Processing status event for {device_serial}: battery={battery}, "
                             f"led_power={led_states['led_power']}, led_defibrillator={led_states['led_defibrillator']}, "
                             f"led_monitoring={led_states['led_monitoring']}, led_assistance={led_states['led_assistance']}, "
-                            f"led_mqtt={led_states['led_mqtt']}, led_environmental={led_states['led_environmental']}, "
-                            f"location=({latitude}, {longitude})")
-                
+                            f"led_mqtt={led_states['led_mqtt']}, led_environmental={led_states['led_environmental']}")
+
                 # Insert status data
                 cur.execute(
                     """
                     INSERT INTO device_data (
                         device_serial, topic, battery, connection, defibrillator, latitude, longitude,
-                        power_source, led_power, led_defibrillator, led_monitoring, led_assistance, 
+                        power_source, led_power, led_defibrillator, led_monitoring, led_assistance,
                         led_mqtt, led_environmental, timestamp, original_timestamp, payload
                     )
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
@@ -950,8 +923,8 @@ class MQTTService:
                         battery,
                         connection[:50] if connection else None,
                         defibrillator,
-                        latitude,  # Now properly handled
-                        longitude,  # Now properly handled
+                        float(latitude) if latitude is not None else None,
+                        float(longitude) if longitude is not None else None,
                         power_source[:50] if power_source else None,
                         led_states["led_power"],
                         led_states["led_defibrillator"],
@@ -964,7 +937,7 @@ class MQTTService:
                         payload_str
                     )
                 )
-                
+
                 # Update LEDs table
                 for led_type, status in led_states.items():
                     if status is not None and status in VALID_LED_STATUSES:
@@ -979,7 +952,7 @@ class MQTTService:
                             (device_serial[:50], led_type[4:], status, None, datetime.now())
                         )
                         logger.info(f"Updated LED for device {device_serial}: type={led_type[4:]}, status={status}")
-                
+
                 # Send alerts for critical conditions
                 if battery is not None and battery < 20:
                     self.send_alert_email(
@@ -987,7 +960,7 @@ class MQTTService:
                         f"Low battery for device {device_serial}: {battery}%",
                         "critical"
                     )
-                
+
                 if led_states["led_power"] == "Red":
                     self.send_alert_email(
                         "Power Supply Issue",
@@ -999,18 +972,18 @@ class MQTTService:
             elif topic.endswith("/event/alert"):
                 if not self.validate_alert_payload(device_serial, topic, data):
                     return
-                
+
                 alert_id = data.get("id")
                 alert_message = data.get("message")
                 logger.debug(f"Processing alert event for {device_serial}: alert_id={alert_id}, alert_message={alert_message}")
-                
+
                 # Update Environmental LED based on alert_id
                 led_environmental = "Off"
                 if alert_id in [6, 8]:  # Critical temperature or thermal regulation fault
                     led_environmental = "Red"
                 elif alert_id == 4:  # Rapid temperature change
                     led_environmental = "Green"
-                
+
                 cur.execute(
                     """
                     INSERT INTO LEDs (device_serial, led_type, status, description, last_updated)
@@ -1018,9 +991,9 @@ class MQTTService:
                     ON CONFLICT (device_serial, led_type)
                     DO UPDATE SET status = EXCLUDED.status, description = EXCLUDED.description, last_updated = EXCLUDED.last_updated
                     """,
-                    (device_serial[:50], "environmental", led_environmental, None, datetime.now())
+                    (device_serial[:50], "Environmental", led_environmental, None, datetime.now())
                 )
-                
+
                 cur.execute(
                     """
                     INSERT INTO device_data (
@@ -1040,14 +1013,14 @@ class MQTTService:
                         led_environmental
                     )
                 )
-                
+
                 alert_desc = ALERT_CODES.get(alert_id, f"Unknown alert ID: {alert_id}")
                 self.send_alert_email(
                     f"Critical Alert - Device {device_serial}",
                     f"Alert for device {device_serial}: {alert_desc} (ID: {alert_id})",
                     "critical"
                 )
-            
+
             # Handle config events (update cache)
             elif topic.endswith("/event/config"):
                 services = data.get("config", {}).get("services", {})
@@ -1055,7 +1028,7 @@ class MQTTService:
                 assistance = services.get("assistance")
                 if monitoring is not None and assistance is not None:
                     self.config_cache[f"{device_serial}_config"] = (str(monitoring).lower(), str(assistance).lower())
-                
+
                 cur.execute(
                     """
                     INSERT INTO device_data (
@@ -1093,10 +1066,10 @@ class MQTTService:
 
             conn.commit()
             logger.info(f"Inserted into device_data for device {device_serial} on topic {topic}")
-            
+
             # Detect critical alerts after successful insertion
             self.detect_critical_alerts(device_serial, topic, data)
-            
+
         except Exception as e:
             logger.error(f"Database error for device {device_serial}: {e}")
             conn.rollback()
