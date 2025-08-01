@@ -1,399 +1,1808 @@
-import tkinter as tk
-from tkinter import ttk, messagebox, scrolledtext
-import threading
+import dash
+from dash import dcc, html, Input, Output, State, dash_table, callback_context
+import dash_bootstrap_components as dbc
+import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import pandas as pd
+import psycopg2
+from psycopg2 import pool
 import json
-import queue
+import uuid
 import time
-from datetime import datetime, timezone
-from typing import Dict, Any
+from datetime import datetime, timedelta, timezone
+from decouple import config
+import paho.mqtt.client as mqtt
+import ssl
+import threading
 import logging
-from mqtt import MQTTService, VALID_AUDIO_MESSAGES, ALERT_CODES, RESULT_CODES
+import hashlib
+from collections import deque
+from cachetools import TTLCache
 
 # Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('gui.log'),
-        logging.StreamHandler()
-    ]
-)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-class LocacoeurGUI:
-    def __init__(self, root: tk.Tk):
-        self.root = root
-        self.root.title("Locacoeur Cloud API Control Panel")
-        self.root.geometry("1200x800")
-        
-        # Initialize MQTT service
-        self.mqtt_service = MQTTService()
-        self.message_queue = queue.Queue()
-        self.devices = {}  # Store device information
-        self.selected_device = tk.StringVar()
-        
-        # Start MQTT service in a separate thread
-        self.mqtt_thread = threading.Thread(target=self.run_mqtt_service, daemon=True)
-        self.mqtt_thread.start()
-        
-        # Start queue processing
-        self.root.after(100, self.process_queue)
-        
-        self.setup_gui()
-        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
-        
-    def setup_gui(self):
-        """Setup the main GUI layout"""
-        # Main container
-        main_frame = ttk.Frame(self.root, padding="10")
-        main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
-        self.root.columnconfigure(0, weight=1)
-        self.root.rowconfigure(0, weight=1)
-        
-        # Device selection frame
-        device_frame = ttk.LabelFrame(main_frame, text="Device Selection", padding="5")
-        device_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=5)
-        device_frame.columnconfigure(1, weight=1)
-        
-        ttk.Label(device_frame, text="Select Device:").grid(row=0, column=0, padx=5)
-        self.device_combo = ttk.Combobox(device_frame, textvariable=self.selected_device, state="readonly")
-        self.device_combo.grid(row=0, column=1, sticky=(tk.W, tk.E), padx=5)
-        self.device_combo.bind("<<ComboboxSelected>>", self.on_device_select)
-        
-        ttk.Button(device_frame, text="Refresh Devices", command=self.refresh_devices).grid(row=0, column=2, padx=5)
-        
-        # Command frame
-        command_frame = ttk.LabelFrame(main_frame, text="Commands", padding="5")
-        command_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=5)
-        
-        commands = [
-            ("Request Config", self.request_config),
-            ("Request Location", self.request_location),
-            ("Request Firmware Version", self.request_firmware_version),
-            ("Request Logs", self.request_log),
-            ("Play Audio Message 1", lambda: self.play_audio("message_1")),
-            ("Play Audio Message 2", lambda: self.play_audio("message_2")),
-            ("Update Firmware", self.update_firmware),
-        ]
-        
-        for idx, (text, command) in enumerate(commands):
-            ttk.Button(command_frame, text=text, command=command).grid(row=idx//3, column=idx%3, padx=5, pady=2)
-        
-        # Status frame
-        status_frame = ttk.LabelFrame(main_frame, text="Device Status", padding="5")
-        status_frame.grid(row=2, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
-        status_frame.columnconfigure(0, weight=1)
-        status_frame.rowconfigure(1, weight=1)
-        
-        # LED status indicators
-        led_frame = ttk.Frame(status_frame)
-        led_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=5)
-        
-        self.leds = {
-            "Power": tk.StringVar(value="Unknown"),
-            "Defibrillator": tk.StringVar(value="Unknown"),
-            "Monitoring": tk.StringVar(value="Unknown"),
-            "Assistance": tk.StringVar(value="Unknown"),
-            "MQTT": tk.StringVar(value="Unknown"),
-            "Environmental": tk.StringVar(value="Unknown"),
-        }
-        
-        for idx, (led_name, var) in enumerate(self.leds.items()):
-            ttk.Label(led_frame, text=f"{led_name}:").grid(row=0, column=idx*2, padx=5)
-            ttk.Label(led_frame, textvariable=var, width=10).grid(row=0, column=idx*2+1, padx=5)
-        
-        # Status details
-        self.status_text = scrolledtext.ScrolledText(status_frame, height=10, state='disabled')
-        self.status_text.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
-        
-        # Alerts frame
-        alerts_frame = ttk.LabelFrame(main_frame, text="Alerts & Logs", padding="5")
-        alerts_frame.grid(row=3, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
-        alerts_frame.columnconfigure(0, weight=1)
-        alerts_frame.rowconfigure(0, weight=1)
-        
-        self.alerts_text = scrolledtext.ScrolledText(alerts_frame, height=10, state='disabled')
-        self.alerts_text.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
-        
-        # MQTT connection status
-        self.connection_status = tk.StringVar(value="Disconnected")
-        ttk.Label(main_frame, text="MQTT Status:").grid(row=4, column=0, sticky=tk.W, padx=5)
-        ttk.Label(main_frame, textvariable=self.connection_status).grid(row=4, column=0, sticky=tk.E, padx=5)
-        
-    def run_mqtt_service(self):
-        """Run the MQTT service and handle connection status updates"""
-        try:
-            self.mqtt_service.run()
-        except Exception as e:
-            logger.error(f"MQTT service error: {e}")
-            self.message_queue.put(("error", f"MQTT service crashed: {e}"))
-        
-    def process_queue(self):
-        """Process messages from the queue to update GUI"""
-        try:
-            while not self.message_queue.empty():
-                msg_type, data = self.message_queue.get_nowait()
-                if msg_type == "device_data":
-                    self.update_device_data(data)
-                elif msg_type == "result":
-                    self.update_result(data)
-                elif msg_type == "connection_status":
-                    self.connection_status.set(data)
-                elif msg_type == "error":
-                    self.log_alert(f"ERROR: {data}")
-        except queue.Empty:
-            pass
-        self.root.after(100, self.process_queue)
-        
-    def refresh_devices(self):
-        """Refresh the list of known devices from database"""
-        conn = self.mqtt_service.connect_db()
-        if not conn:
-            messagebox.showerror("Error", "Failed to connect to database")
-            return
+# Database configuration
+DB_CONFIG = {
+    "dbname": config("DB_NAME", default="mqtt_db"),
+    "user": config("DB_USER", default="mqtt_user"),
+    "password": config("DB_PASSWORD"),
+    "host": config("DB_HOST", default="91.134.90.10"),
+    "port": config("DB_PORT", default="5432")
+}
+
+# MQTT Configuration
+MQTT_BROKER = config("MQTT_BROKER", default="mqtt.locacoeur.com")
+MQTT_PORT = int(config("MQTT_PORT", default=8883))
+MQTT_CA_CERT = config("MQTT_CA_CERT", default="../certs/ca.crt")
+MQTT_CLIENT_CERT = config("MQTT_CLIENT_CERT", default="../certs/client.crt")
+MQTT_CLIENT_KEY = config("MQTT_CLIENT_KEY", default="../certs/client.key")
+MQTT_USERNAME = config("MQTT_USERNAME", default="locacoeur")
+MQTT_PASSWORD = config("MQTT_PASSWORD", default=None)
+
+# Constants
+TOPIC_PREFIX = "LC1"
+ALERT_CODES = {
+    1: "Device is moving",
+    2: "Power is cut",
+    3: "Defibrillator fault",
+    4: "Rapid temperature change",
+    5: "Defibrillator hold range alert",
+    6: "Critical temperature alert",
+    7: "Lost connection",
+    8: "Thermal regulation alert",
+    9: "Device is removed"
+}
+
+RESULT_CODES = {
+    0: "Success",
+    -1: "Missing opId",
+    -2: "Null object reference",
+    -3: "Audio file not found"
+}
+
+# Add required imports at the top
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.utils import formatdate
+
+# Email settings
+EMAIL_CONFIG = {
+    "smtp_server": config("SMTP_SERVER", default="ssl0.ovh.net"),
+    "smtp_port": int(config("SMTP_PORT", default=587)),
+    "username": config("SMTP_USERNAME", default="support@locacoeur.com"),
+    "password": config("SMTP_PASSWORD", default=""),
+    "from_email": config("SMTP_FROM_EMAIL", default="support@locacoeur.com"),
+    "to_emails": config("SMTP_TO_EMAILS", default="alert@locacoeur.com").split(","),
+    "enabled": config("SMTP_ENABLED", default=True, cast=bool)
+}
+
+VALID_LED_STATUSES = {"Green", "Red", "Off"}
+VALID_AUDIO_MESSAGES = ["message_1", "message_2"]
+VALID_POWER_SOURCES = ["ac", "battery"]
+VALID_CONNECTIONS = ["lte", "wifi"]
+VALID_DEFIBRILLATOR_CODES = [0, -1, -2, -3, -4, -5, -6, -7, -8, -9]
+
+class DatabaseManager:
+    def __init__(self):
+        self.db_pool = psycopg2.pool.SimpleConnectionPool(1, 20, **DB_CONFIG)
+
+    def get_connection(self):
+        return self.db_pool.getconn()
+
+    def release_connection(self, conn):
+        self.db_pool.putconn(conn)
+
+    def execute_query(self, query, params=None):
+        conn = self.get_connection()
         try:
             cur = conn.cursor()
-            cur.execute("SELECT serial FROM Devices")
-            devices = [row[0] for row in cur.fetchall()]
-            self.device_combo['values'] = devices
-            if devices and not self.selected_device.get():
-                self.selected_device.set(devices[0])
-                self.on_device_select(None)
+            cur.execute(query, params)
+            if query.strip().upper().startswith('SELECT'):
+                result = cur.fetchall()
+                columns = [desc[0] for desc in cur.description]
+                return pd.DataFrame(result, columns=columns)
+            else:
+                conn.commit()
+                return True
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to refresh devices: {e}")
+            conn.rollback()
+            logger.error(f"Database error: {e}")
+            raise e
         finally:
             cur.close()
-            self.mqtt_service.release_db(conn)
-        
-    def on_device_select(self, event):
-        """Handle device selection change"""
-        device_serial = self.selected_device.get()
-        if not device_serial:
-            return
-        self.update_status_display(device_serial)
-        
-    def update_status_display(self, device_serial: str):
-        """Update status display for selected device"""
-        conn = self.mqtt_service.connect_db()
-        if not conn:
-            return
+            self.release_connection(conn)
+
+    def get_device_locations(self, device_serial=None, limit=100):
+        """Get device locations from database"""
+        if device_serial:
+            query = """
+            SELECT device_serial, latitude, longitude, timestamp,
+                   CASE
+                       WHEN timestamp IS NOT NULL THEN to_timestamp(timestamp/1000.0)
+                       ELSE created_at
+                   END as location_time
+            FROM device_data
+            WHERE device_serial = %s
+            AND latitude IS NOT NULL
+            AND longitude IS NOT NULL
+            ORDER BY timestamp DESC
+            LIMIT %s
+            """
+            params = (device_serial, limit)
+        else:
+            query = """
+            SELECT DISTINCT ON (device_serial)
+                device_serial, latitude, longitude, timestamp,
+                CASE
+                    WHEN timestamp IS NOT NULL THEN to_timestamp(timestamp/1000.0)
+                    ELSE created_at
+                END as location_time
+            FROM device_data
+            WHERE latitude IS NOT NULL
+            AND longitude IS NOT NULL
+            ORDER BY device_serial,
+                     CASE
+                        WHEN timestamp IS NOT NULL THEN to_timestamp(timestamp/1000.0)
+                        ELSE created_at
+                     END DESC
+            """
+            params = None
+
+        return self.execute_query(query, params)
+
+    def get_service_status(self, device_serial):
+        """Get monitoring and assistance service status"""
+        query = """
+        SELECT payload->'config'->'services'->>'monitoring' as monitoring,
+               payload->'config'->'services'->>'assistance' as assistance,
+               created_at
+        FROM device_data
+        WHERE device_serial = %s
+        AND topic LIKE %s
+        AND payload->'config'->'services' IS NOT NULL
+        ORDER BY created_at DESC
+        LIMIT 1
+        """
+        return self.execute_query(query, (device_serial, f"{TOPIC_PREFIX}/{device_serial}/event/config"))
+
+    def get_device_alerts(self, device_serial=None, hours=24):
+        """Get device alerts from the last N hours"""
+        base_query = """
+        SELECT device_serial, alert_id, alert_message, timestamp,
+               CASE
+                   WHEN timestamp IS NOT NULL THEN to_timestamp(timestamp/1000.0)
+                   ELSE created_at
+               END as alert_time
+        FROM device_data
+        WHERE alert_id IS NOT NULL
+        AND CASE
+                WHEN timestamp IS NOT NULL THEN to_timestamp(timestamp/1000.0)
+                ELSE created_at
+            END >= NOW() - INTERVAL '{} hours'
+        """.format(hours)
+
+        if device_serial:
+            query = base_query + " AND device_serial = %s ORDER BY alert_time DESC"
+            params = (device_serial,)
+        else:
+            query = base_query + " ORDER BY alert_time DESC"
+            params = None
+
+        return self.execute_query(query, params)
+
+    def get_firmware_versions(self):
+        """Get firmware versions for all devices"""
+        query = """
+        SELECT DISTINCT ON (device_serial)
+            device_serial,
+            payload->>'version' as firmware_version,
+            created_at
+        FROM device_data
+        WHERE topic LIKE %s
+        AND payload->>'version' IS NOT NULL
+        ORDER BY device_serial, created_at DESC
+        """
+        return self.execute_query(query, (f"{TOPIC_PREFIX}/%/event/version",))
+
+class MQTTPublisher:
+    def __init__(self):
+        self.client = None
+        self.command_cache = {}
+        self.command_lock = threading.Lock()
+        self.setup_client()
+        self.connect()
+
+    def setup_client(self):
+        self.client = mqtt.Client(
+            mqtt.CallbackAPIVersion.VERSION2,
+            client_id=f"dashboard-{uuid.uuid4()}",
+            protocol=mqtt.MQTTv5
+        )
+
+        # Configure TLS
         try:
-            cur = conn.cursor()
-            # Get latest status
-            cur.execute(
-                """
-                SELECT payload, led_power, led_defibrillator, led_monitoring, 
-                       led_assistance, led_mqtt, led_environmental
-                FROM device_data
-                WHERE device_serial = %s AND topic LIKE %s
-                ORDER BY timestamp DESC LIMIT 1
-                """,
-                (device_serial, f"LC1/{device_serial}/event/status")
+            self.client.tls_set(
+                ca_certs=MQTT_CA_CERT,
+                certfile=MQTT_CLIENT_CERT,
+                keyfile=MQTT_CLIENT_KEY,
+                cert_reqs=ssl.CERT_REQUIRED,
+                tls_version=ssl.PROTOCOL_TLSv1_2
             )
-            result = cur.fetchone()
-            if result:
-                payload, power, defib, mon, assist, mqtt, env = result
-                payload = json.loads(payload)
-                
-                # Update LED indicators
-                self.leds["Power"].set(power or "Unknown")
-                self.leds["Defibrillator"].set(defib or "Unknown")
-                self.leds["Monitoring"].set(mon or "Unknown")
-                self.leds["Assistance"].set(assist or "Unknown")
-                self.leds["MQTT"].set(mqtt or "Unknown")
-                self.leds["Environmental"].set(env or "Unknown")
-                
-                # Update status text
-                self.status_text.configure(state='normal')
-                self.status_text.delete(1.0, tk.END)
-                status_info = (
-                    f"Battery: {payload.get('battery', 'Unknown')}%\n"
-                    f"Power Source: {payload.get('power_source', 'Unknown')}\n"
-                    f"Defibrillator Status: {payload.get('defibrillator', 'Unknown')}\n"
-                    f"Connection: {payload.get('connection', 'Unknown')}\n"
-                    f"Location: Lat {payload.get('location', {}).get('latitude', 'Unknown')}, "
-                    f"Lon {payload.get('location', {}).get('longitude', 'Unknown')}\n"
-                    f"Timestamp: {datetime.fromtimestamp(payload.get('timestamp', 0)/1000, tz=timezone.utc)}"
-                )
-                self.status_text.insert(tk.END, status_info)
-                self.status_text.configure(state='disabled')
-                
         except Exception as e:
-            logger.error(f"Failed to update status for {device_serial}: {e}")
-        finally:
-            cur.close()
-            self.mqtt_service.release_db(conn)
-        
-    def update_device_data(self, data: Dict[str, Any]):
-        """Update GUI with new device data"""
-        device_serial = data.get("device_serial")
-        topic = data.get("topic")
-        payload = data.get("payload")
-        
-        if device_serial == self.selected_device.get():
-            if topic.endswith("/event/status"):
-                self.update_status_display(device_serial)
-            elif topic.endswith("/event/alert"):
-                alert_id = payload.get("id")
-                alert_desc = ALERT_CODES.get(alert_id, f"Unknown alert ID: {alert_id}")
-                self.log_alert(f"Alert for {device_serial}: {alert_desc} (ID: {alert_id})")
-            elif topic.endswith("/event/config"):
-                self.log_alert(f"Config updated for {device_serial}: {json.dumps(payload, indent=2)}")
-        
-        # Update device list if new device detected
-        if device_serial not in self.device_combo['values']:
-            self.refresh_devices()
-        
-    def update_result(self, data: Dict[str, Any]):
-        """Update GUI with command result"""
-        device_serial = data.get("device_serial")
-        result_code = int(data.get("result_status", -1))
-        result_desc = RESULT_CODES.get(result_code, f"Unknown result code: {result_code}")
-        message = data.get("result_message", "")
-        
-        if device_serial == self.selected_device.get():
-            self.log_alert(f"Command result for {device_serial}: {result_desc} ({message})")
-            
-    def log_alert(self, message: str):
-        """Log alert or message to alerts text area"""
-        self.alerts_text.configure(state='normal')
-        timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
-        self.alerts_text.insert(tk.END, f"[{timestamp}] {message}\n")
-        self.alerts_text.see(tk.END)
-        self.alerts_text.configure(state='disabled')
-        
-    def request_config(self):
+            logger.error(f"TLS configuration failed: {e}")
+
+        if MQTT_USERNAME and MQTT_PASSWORD:
+            self.client.username_pw_set(username=MQTT_USERNAME, password=MQTT_PASSWORD)
+
+    def connect(self):
+        try:
+            self.client.connect(MQTT_BROKER, MQTT_PORT, keepalive=60)
+            self.client.loop_start()
+            logger.info("MQTT Publisher connected")
+            return True
+        except Exception as e:
+            logger.error(f"MQTT connection failed: {e}")
+            return False
+
+    def publish_command(self, device_serial, command_type, payload):
+        """Publish command to device"""
+        topic = f"{TOPIC_PREFIX}/{device_serial}/command/{command_type}"
+        try:
+            result = self.client.publish(topic, json.dumps(payload), qos=1)
+            logger.info(f"Published command to {topic}: {payload}")
+
+            # Store command for tracking
+            with self.command_lock:
+                self.command_cache[(device_serial, payload.get("opId"))] = {
+                    "topic": topic,
+                    "sent_time": datetime.now(timezone.utc),
+                    "payload": payload
+                }
+
+            return result.rc == mqtt.MQTT_ERR_SUCCESS
+        except Exception as e:
+            logger.error(f"Failed to publish command: {e}")
+            return False
+
+    def request_config(self, device_serial):
         """Request device configuration"""
-        device_serial = self.selected_device.get()
-        if not device_serial:
-            messagebox.showwarning("Warning", "Please select a device")
-            return
-        try:
-            self.mqtt_service.request_config(device_serial)
-            self.log_alert(f"Requested configuration for {device_serial}")
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to request config: {e}")
-        
-    def request_location(self):
-        """Request device location"""
-        device_serial = self.selected_device.get()
-        if not device_serial:
-            messagebox.showwarning("Warning", "Please select a device")
-            return
-        try:
-            self.mqtt_service.request_location(device_serial)
-            self.log_alert(f"Requested location for {device_serial}")
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to request location: {e}")
-        
-    def request_firmware_version(self):
+        op_id = str(uuid.uuid4())
+        payload = {"opId": op_id}
+        return self.publish_command(device_serial, "config/get", payload)
+
+    def set_config(self, device_serial, config_data):
+        """Set device configuration"""
+        op_id = str(uuid.uuid4())
+        payload = {"opId": op_id, "config": config_data}
+        return self.publish_command(device_serial, "config", payload)
+
+    def request_firmware_version(self, device_serial):
         """Request firmware version"""
-        device_serial = self.selected_device.get()
-        if not device_serial:
-            messagebox.showwarning("Warning", "Please select a device")
-            return
-        try:
-            self.mqtt_service.request_firmware_version(device_serial)
-            self.log_alert(f"Requested firmware version for {device_serial}")
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to request firmware version: {e}")
-        
-    def request_log(self):
-        """Request device logs"""
-        device_serial = self.selected_device.get()
-        if not device_serial:
-            messagebox.showwarning("Warning", "Please select a device")
-            return
-        try:
-            self.mqtt_service.request_log(device_serial)
-            self.log_alert(f"Requested logs for {device_serial}")
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to request logs: {e}")
-        
-    def play_audio(self, audio_message: str):
+        op_id = str(uuid.uuid4())
+        payload = {"opId": op_id}
+        return self.publish_command(device_serial, "version/get", payload)
+
+    def update_firmware(self, device_serial, version, firmware_url=None):
+        """Update device firmware"""
+        op_id = str(uuid.uuid4())
+        payload = {"opId": op_id, "version": version}
+        if firmware_url:
+            payload["url"] = firmware_url
+        return self.publish_command(device_serial, "update", payload)
+
+    def request_location(self, device_serial):
+        """Request device location"""
+        op_id = str(uuid.uuid4())
+        payload = {"opId": op_id}
+        return self.publish_command(device_serial, "location", payload)
+
+    def play_audio(self, device_serial, audio_message):
         """Play audio message on device"""
-        device_serial = self.selected_device.get()
-        if not device_serial:
-            messagebox.showwarning("Warning", "Please select a device")
-            return
-        try:
-            self.mqtt_service.play_audio(device_serial, audio_message)
-            self.log_alert(f"Sent play audio command ({audio_message}) for {device_serial}")
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to play audio: {e}")
-        
-    def update_firmware(self):
-        """Open dialog to update firmware"""
-        device_serial = self.selected_device.get()
-        if not device_serial:
-            messagebox.showwarning("Warning", "Please select a device")
-            return
-            
-        dialog = tk.Toplevel(self.root)
-        dialog.title("Update Firmware")
-        dialog.geometry("400x200")
-        dialog.transient(self.root)
-        
-        ttk.Label(dialog, text="Firmware Version:").grid(row=0, column=0, padx=5, pady=5)
-        version_var = tk.StringVar(value="2.1.1")
-        ttk.Entry(dialog, textvariable=version_var).grid(row=0, column=1, padx=5, pady=5)
-        
-        ttk.Label(dialog, text="Firmware URL (optional):").grid(row=1, column=0, padx=5, pady=5)
-        url_var = tk.StringVar()
-        ttk.Entry(dialog, textvariable=url_var).grid(row=1, column=1, padx=5, pady=5)
-        
-        def submit():
+        if audio_message not in VALID_AUDIO_MESSAGES:
+            logger.error(f"Invalid audio message: {audio_message}")
+            return False
+
+        op_id = str(uuid.uuid4())
+        payload = {"opId": op_id, "audioMessage": audio_message}
+        return self.publish_command(device_serial, "play", payload)
+
+    def request_logs(self, device_serial):
+        """Request device logs"""
+        op_id = str(uuid.uuid4())
+        payload = {"opId": op_id}
+        return self.publish_command(device_serial, "log/get", payload)
+
+# Initialize components
+db_manager = DatabaseManager()
+mqtt_publisher = MQTTPublisher()
+
+# Initialize Dash app
+app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP, dbc.icons.BOOTSTRAP])
+app.title = "LOCACOEUR MQTT Dashboard"
+
+# Layout
+app.layout = dbc.Container([
+    dbc.Row([
+        dbc.Col([
+            html.H1([
+                html.I(className="bi bi-heart-pulse me-2"),
+                "LOCACOEUR MQTT Dashboard"
+            ], className="text-center mb-4 text-primary"),
+            html.Hr()
+        ])
+    ]),
+
+    # Alert Banner
+    html.Div(id="alert-banner", className="mb-3"),
+
+    # Control Panel
+    dbc.Row([
+        dbc.Col([
+            dbc.Card([
+                dbc.CardHeader([
+                    html.I(className="bi bi-gear-fill me-2"),
+                    "Device Control Panel"
+                ]),
+                dbc.CardBody([
+                    dbc.Row([
+                        dbc.Col([
+                            dbc.Label("Select Device:"),
+                            dcc.Dropdown(
+                                id="device-selector",
+                                placeholder="Select a device...",
+                                style={"marginBottom": "10px"}
+                            )
+                        ], width=4),
+                        dbc.Col([
+                            dbc.Label("Command Type:"),
+                            dcc.Dropdown(
+                                id="command-type",
+                                options=[
+                                    {"label": "Get Config", "value": "config/get"},
+                                    {"label": "Set Config", "value": "config"},
+                                    {"label": "Get Version", "value": "version/get"},
+                                    {"label": "Update Firmware", "value": "update"},
+                                    {"label": "Get Location", "value": "location"},
+                                    {"label": "Play Audio", "value": "play"},
+                                    {"label": "Get Logs", "value": "log/get"}
+                                ],
+                                placeholder="Select command...",
+                                style={"marginBottom": "10px"}
+                            )
+                        ], width=4),
+                        dbc.Col([
+                            dbc.Label("Quick Actions:"),
+                            html.Div([
+                                dbc.Button([
+                                    html.I(className="bi bi-arrow-clockwise me-1"),
+                                    "Refresh"
+                                ], id="refresh-btn", color="secondary", size="sm", className="me-1"),
+                                dbc.Button([
+                                    html.I(className="bi bi-exclamation-triangle me-1"),
+                                    "Alerts"
+                                ], id="show-alerts-btn", color="warning", size="sm")
+                            ])
+                        ], width=4)
+                    ]),
+                    html.Br(),
+                    dbc.Row([
+                        dbc.Col([
+                            dbc.Button([
+                                html.I(className="bi bi-send me-1"),
+                                "Execute Command"
+                            ], id="execute-btn", color="primary", className="me-2"),
+                            dbc.Button([
+                                html.I(className="bi bi-geo-alt me-1"),
+                                "Get All Locations"
+                            ], id="get-locations-btn", color="info", className="me-2"),
+                            dbc.Button([
+                                html.I(className="bi bi-list-check me-1"),
+                                "Check Services"
+                            ], id="check-services-btn", color="success")
+                        ])
+                    ]),
+                    html.Div(id="command-response", className="mt-3")
+                ])
+            ])
+        ])
+    ], className="mb-4"),
+
+    # Device Status Cards
+    dbc.Row([
+        dbc.Col([
+            html.H3([
+                html.I(className="bi bi-activity me-2"),
+                "Device Status Overview"
+            ]),
+            html.Div(id="device-status-cards")
+        ])
+    ], className="mb-4"),
+
+    # Tabs for different views
+    dbc.Tabs([
+        dbc.Tab(label="Real-time Monitoring", tab_id="monitoring",
+                tab_style={"padding": "10px"}, active_tab_style={"fontWeight": "bold"}),
+        dbc.Tab(label="Device Data", tab_id="data",
+                tab_style={"padding": "10px"}, active_tab_style={"fontWeight": "bold"}),
+        dbc.Tab(label="Alerts & Events", tab_id="alerts",
+                tab_style={"padding": "10px"}, active_tab_style={"fontWeight": "bold"}),
+        dbc.Tab(label="Commands & Results", tab_id="commands",
+                tab_style={"padding": "10px"}, active_tab_style={"fontWeight": "bold"}),
+        dbc.Tab(label="Configuration", tab_id="config",
+                tab_style={"padding": "10px"}, active_tab_style={"fontWeight": "bold"}),
+        dbc.Tab(label="Location Tracking", tab_id="locations",
+                tab_style={"padding": "10px"}, active_tab_style={"fontWeight": "bold"}),
+        dbc.Tab(label="Service Management", tab_id="services",
+                tab_style={"padding": "10px"}, active_tab_style={"fontWeight": "bold"}),
+        dbc.Tab(label="Analytics", tab_id="analytics",
+                tab_style={"padding": "10px"}, active_tab_style={"fontWeight": "bold"})
+    ], id="main-tabs", active_tab="monitoring"),
+
+    html.Div(id="tab-content", className="mt-4"),
+
+    # Auto-refresh interval
+    dcc.Interval(
+        id='interval-component',
+        interval=30*1000,  # 30 seconds
+        n_intervals=0
+    ),
+
+    # Stores for data
+    dcc.Store(id='device-data-store'),
+    dcc.Store(id='selected-device-store'),
+    dcc.Store(id='locations-store'),
+    dcc.Store(id='services-store')
+
+], fluid=True)
+
+# Callbacks
+
+@app.callback(
+    Output('device-selector', 'options'),
+    Input('interval-component', 'n_intervals')
+)
+def update_device_list(n):
+    try:
+        df = db_manager.execute_query("SELECT DISTINCT serial FROM Devices ORDER BY serial")
+        options = [{"label": serial, "value": serial} for serial in df['serial']]
+        return options
+    except Exception as e:
+        logger.error(f"Error updating device list: {e}")
+        return []
+
+@app.callback(
+    [Output('device-data-store', 'data'),
+     Output('alert-banner', 'children')],
+    [Input('interval-component', 'n_intervals'),
+     Input('refresh-btn', 'n_clicks')]
+)
+def update_device_data(n_intervals, refresh_clicks):
+    try:
+        # Get latest device data
+        query = """
+        SELECT DISTINCT ON (device_serial)
+            device_serial, battery, connection, defibrillator, latitude, longitude,
+            power_source, led_power, led_defibrillator, led_monitoring,
+            led_assistance, led_mqtt, led_environmental, timestamp,
+            CASE
+                WHEN timestamp IS NOT NULL THEN to_timestamp(timestamp/1000.0)
+                ELSE CURRENT_TIMESTAMP
+            END as created_at
+        FROM device_data
+        WHERE CASE
+                WHEN timestamp IS NOT NULL THEN to_timestamp(timestamp/1000.0)
+                ELSE CURRENT_TIMESTAMP
+              END >= NOW() - INTERVAL '24 hours'
+        ORDER BY device_serial,
+                 CASE
+                    WHEN timestamp IS NOT NULL THEN to_timestamp(timestamp/1000.0)
+                    ELSE CURRENT_TIMESTAMP
+                 END DESC
+        """
+        df = db_manager.execute_query(query)
+
+        # Check for critical alerts
+        alert_banner = None
+        critical_devices = []
+
+        for _, device in df.iterrows():
+            if device.get('battery', 100) < 20:
+                critical_devices.append(f"{device['device_serial']} (Battery: {device.get('battery', 0)}%)")
+            if device.get('led_defibrillator') == 'Red':
+                critical_devices.append(f"{device['device_serial']} (Defibrillator Issue)")
+
+        if critical_devices:
+            alert_banner = dbc.Alert([
+                html.H4([html.I(className="bi bi-exclamation-triangle me-2"), "Critical Alerts"], className="alert-heading"),
+                html.P(f"Issues detected on: {', '.join(critical_devices[:3])}" +
+                      ("..." if len(critical_devices) > 3 else ""))
+            ], color="danger", dismissable=True)
+
+        return df.to_dict('records'), alert_banner
+
+    except Exception as e:
+        logger.error(f"Error updating device data: {e}")
+        return [], None
+
+@app.callback(
+    Output('locations-store', 'data'),
+    Input('get-locations-btn', 'n_clicks')
+)
+def update_locations_data(n_clicks):
+    if not n_clicks:
+        return []
+
+    try:
+        df = db_manager.get_device_locations()
+        return df.to_dict('records')
+    except Exception as e:
+        logger.error(f"Error getting locations: {e}")
+        return []
+
+@app.callback(
+    Output('services-store', 'data'),
+    Input('check-services-btn', 'n_clicks')
+)
+def update_services_data(n_clicks):
+    if not n_clicks:
+        return []
+
+    try:
+        # Get all devices
+        devices_df = db_manager.execute_query("SELECT DISTINCT serial FROM Devices")
+        services_data = []
+
+        for _, row in devices_df.iterrows():
+            device_serial = row['serial']
+            service_df = db_manager.get_service_status(device_serial)
+
+            if not service_df.empty:
+                services_data.append({
+                    'device_serial': device_serial,
+                    'monitoring': service_df.iloc[0]['monitoring'],
+                    'assistance': service_df.iloc[0]['assistance'],
+                    'last_updated': service_df.iloc[0]['created_at']
+                })
+            else:
+                services_data.append({
+                    'device_serial': device_serial,
+                    'monitoring': 'Unknown',
+                    'assistance': 'Unknown',
+                    'last_updated': None
+                })
+
+        return services_data
+    except Exception as e:
+        logger.error(f"Error getting services data: {e}")
+        return []
+
+@app.callback(
+    Output('device-status-cards', 'children'),
+    Input('device-data-store', 'data')
+)
+def update_status_cards(device_data):
+    if not device_data:
+        return html.P("No device data available")
+
+    cards = []
+    for device in device_data:
+        # LED status indicators
+        led_indicators = []
+        led_types = ['power', 'defibrillator', 'monitoring', 'assistance', 'mqtt', 'environmental']
+
+        for led_type in led_types:
+            led_key = f'led_{led_type}'
+            status = device.get(led_key, 'Off')
+            if status == 'Green':
+                color, icon = 'success', 'bi-check-circle-fill'
+            elif status == 'Red':
+                color, icon = 'danger', 'bi-x-circle-fill'
+            else:
+                color, icon = 'secondary', 'bi-circle'
+
+            led_indicators.append(
+                dbc.Badge([
+                    html.I(className=f"bi {icon} me-1"),
+                    f"{led_type.title()}: {status}"
+                ], color=color, className="me-1 mb-1")
+            )
+
+        # Battery level color and icon
+        battery = device.get('battery', 0)
+        if battery < 20:
+            battery_color, battery_icon = 'danger', 'bi-battery'
+        elif battery < 50:
+            battery_color, battery_icon = 'warning', 'bi-battery-half'
+        else:
+            battery_color, battery_icon = 'success', 'bi-battery-full'
+
+        # Last update time
+        last_update = device.get('created_at')
+        if last_update and pd.notna(last_update):
             try:
-                version = version_var.get().strip()
-                url = url_var.get().strip() or None
-                if not version:
-                    messagebox.showwarning("Warning", "Version is required")
-                    return
-                self.mqtt_service.update_firmware(device_serial, version, url)
-                self.log_alert(f"Sent firmware update command for {device_serial} (version: {version})")
-                dialog.destroy()
-            except Exception as e:
-                messagebox.showerror("Error", f"Failed to send firmware update: {e}")
-        
-        ttk.Button(dialog, text="Update", command=submit).grid(row=2, column=0, padx=5, pady=10)
-        ttk.Button(dialog, text="Cancel", command=dialog.destroy).grid(row=2, column=1, padx=5, pady=10)
-        
-    def on_closing(self):
-        """Handle window closing"""
-        if messagebox.askokcancel("Quit", "Do you want to quit?"):
-            self.mqtt_service.running = False
-            self.root.destroy()
+                last_update_str = pd.to_datetime(last_update).strftime('%Y-%m-%d %H:%M:%S')
+            except:
+                last_update_str = 'Unknown'
+        else:
+            last_update_str = 'Unknown'
 
-# Override MQTTService methods to integrate with GUI
-class GUIMQTTService(MQTTService):
-    def __init__(self, gui_queue: queue.Queue):
-        super().__init__()
-        self.gui_queue = gui_queue
-        
-    def on_connect(self, client, userdata, flags, reason_code, properties=None):
-        super().on_connect(client, userdata, flags, reason_code, properties)
-        status = "Connected" if reason_code == 0 else f"Disconnected (Code: {reason_code})"
-        self.gui_queue.put(("connection_status", status))
-        
-    def insert_device_data(self, device_serial: str, topic: str, data: Dict[str, Any]) -> None:
-        super().insert_device_data(device_serial, topic, data)
-        self.gui_queue.put(("device_data", {
-            "device_serial": device_serial,
-            "topic": topic,
-            "payload": data
-        }))
-        
-    def insert_result(self, device_serial: str, topic: str, data: Dict[str, Any]) -> None:
-        super().insert_result(device_serial, topic, data)
-        self.gui_queue.put(("result", {
-            "device_serial": device_serial,
-            "result_status": data.get("result"),
-            "result_message": data.get("message", "")
-        }))
+        card = dbc.Card([
+            dbc.CardHeader([
+                html.H5([
+                    html.I(className="bi bi-device-hdd me-2"),
+                    f"Device {device['device_serial']}"
+                ], className="mb-0")
+            ]),
+            dbc.CardBody([
+                dbc.Row([
+                    dbc.Col([
+                        html.P([
+                            html.I(className=f"bi {battery_icon} me-2"),
+                            html.Strong("Battery: "),
+                            dbc.Badge(f"{battery}%", color=battery_color)
+                        ]),
+                        html.P([
+                            html.I(className="bi bi-wifi me-2"),
+                            html.Strong("Connection: "),
+                            device.get('connection', 'Unknown')
+                        ]),
+                        html.P([
+                            html.I(className="bi bi-power me-2"),
+                            html.Strong("Power Source: "),
+                            device.get('power_source', 'Unknown')
+                        ]),
+                        html.P([
+                            html.I(className="bi bi-heart-pulse me-2"),
+                            html.Strong("Defibrillator: "),
+                            device.get('defibrillator', 'Unknown')
+                        ])
+                    ], width=6),
+                    dbc.Col([
+                        html.P([
+                            html.I(className="bi bi-lightbulb me-2"),
+                            html.Strong("LED Status:")
+                        ], className="fw-bold"),
+                        html.Div(led_indicators),
+                        html.P([
+                            html.I(className="bi bi-clock me-2"),
+                            html.Strong("Last Update: "),
+                            html.Small(last_update_str)
+                        ], className="mt-2")
+                    ], width=6)
+                ])
+            ])
+        ], className="mb-3")
 
-if __name__ == "__main__":
-    root = tk.Tk()
-    # Replace MQTTService with GUIMQTTService
-    gui = LocacoeurGUI(root)
-    gui.mqtt_service = GUIMQTTService(gui.message_queue)
-    root.mainloop()
+        cards.append(dbc.Col(card, width=12, lg=6, xl=4))
+
+    return dbc.Row(cards)
+
+@app.callback(
+    Output('tab-content', 'children'),
+    [Input('main-tabs', 'active_tab'),
+     Input('device-data-store', 'data'),
+     Input('locations-store', 'data'),
+     Input('services-store', 'data')]
+)
+def render_tab_content(active_tab, device_data, locations_data, services_data):
+    if active_tab == "monitoring":
+        return render_monitoring_tab(device_data)
+    elif active_tab == "data":
+        return render_data_tab()
+    elif active_tab == "alerts":
+        return render_alerts_tab()
+    elif active_tab == "commands":
+        return render_commands_tab()
+    elif active_tab == "config":
+        return render_config_tab()
+    elif active_tab == "locations":
+        return render_locations_tab(locations_data)
+    elif active_tab == "services":
+        return render_services_tab(services_data)
+    elif active_tab == "analytics":
+        return render_analytics_tab()
+    return html.Div("Select a tab")
+
+def render_monitoring_tab(device_data):
+    if not device_data:
+        return html.P("No device data available for monitoring")
+
+    df = pd.DataFrame(device_data)
+
+    # Create battery level chart
+    fig_battery = px.bar(
+        df,
+        x='device_serial',
+        y='battery',
+        title='Battery Levels by Device',
+        color='battery',
+        color_continuous_scale=['red', 'yellow', 'green'],
+        labels={'device_serial': 'Device Serial', 'battery': 'Battery Level (%)'}
+    )
+    fig_battery.update_layout(height=400, showlegend=False)
+
+    # Create LED status summary
+    led_cols = ['led_power', 'led_defibrillator', 'led_monitoring', 'led_assistance', 'led_mqtt', 'led_environmental']
+    led_status_data = []
+
+    for col in led_cols:
+        if col in df.columns:
+            status_counts = df[col].value_counts()
+            for status, count in status_counts.items():
+                led_status_data.append({
+                    'LED_Type': col.replace('led_', '').title(),
+                    'Status': status,
+                    'Count': count
+                })
+
+    if led_status_data:
+        led_df = pd.DataFrame(led_status_data)
+        fig_led = px.bar(
+            led_df,
+            x='LED_Type',
+            y='Count',
+            color='Status',
+            title='LED Status Distribution',
+            color_discrete_map={'Green': 'green', 'Red': 'red', 'Off': 'gray'}
+        )
+        fig_led.update_layout(height=400)
+    else:
+        fig_led = go.Figure()
+        fig_led.update_layout(title="No LED data available", height=400)
+
+    # Device connectivity status
+    connection_counts = df['connection'].value_counts() if 'connection' in df.columns else pd.Series()
+    if not connection_counts.empty:
+        fig_connection = px.pie(
+            values=connection_counts.values,
+            names=connection_counts.index,
+            title='Device Connectivity Distribution'
+        )
+        fig_connection.update_layout(height=300)
+    else:
+        fig_connection = go.Figure()
+        fig_connection.update_layout(title="No connection data available", height=300)
+
+    return dbc.Row([
+        dbc.Col([
+            dcc.Graph(figure=fig_battery)
+        ], width=6),
+        dbc.Col([
+            dcc.Graph(figure=fig_led)
+        ], width=6),
+        dbc.Col([
+            dcc.Graph(figure=fig_connection)
+        ], width=6),
+        dbc.Col([
+            html.H5("System Status Summary"),
+            html.Div([
+                dbc.Badge(f"Total Devices: {len(df)}", color="primary", className="me-2 mb-2"),
+                dbc.Badge(f"Low Battery: {len(df[df['battery'] < 20])}",
+                         color="danger" if len(df[df['battery'] < 20]) > 0 else "success",
+                         className="me-2 mb-2"),
+                dbc.Badge(f"Offline: {len(df[df['led_mqtt'] == 'Red'])}",
+                         color="warning" if len(df[df['led_mqtt'] == 'Red']) > 0 else "success",
+                         className="me-2 mb-2"),
+                dbc.Badge(f"Defibrillator Issues: {len(df[df['led_defibrillator'] == 'Red'])}",
+                         color="danger" if len(df[df['led_defibrillator'] == 'Red']) > 0 else "success",
+                         className="me-2 mb-2")
+            ])
+        ], width=6)
+    ])
+
+def render_data_tab():
+    try:
+        # Get recent device data
+        query = """
+        SELECT device_serial, topic, battery, connection, defibrillator,
+               latitude, longitude, power_source, timestamp,
+               led_power, led_defibrillator, led_monitoring, led_assistance, led_mqtt, led_environmental,
+               CASE
+                   WHEN timestamp IS NOT NULL THEN to_timestamp(timestamp/1000.0)
+                   ELSE CURRENT_TIMESTAMP
+               END as created_at
+        FROM device_data
+        WHERE CASE
+                WHEN timestamp IS NOT NULL THEN to_timestamp(timestamp/1000.0)
+                ELSE CURRENT_TIMESTAMP
+              END >= NOW() - INTERVAL '24 hours'
+        ORDER BY CASE
+                   WHEN timestamp IS NOT NULL THEN to_timestamp(timestamp/1000.0)
+                   ELSE CURRENT_TIMESTAMP
+                 END DESC
+        LIMIT 100
+        """
+        df = db_manager.execute_query(query)
+
+        if df.empty:
+            return html.P("No recent device data available")
+
+        # Convert timestamp for display
+        if 'created_at' in df.columns:
+            df['created_at'] = pd.to_datetime(df['created_at']).dt.strftime('%Y-%m-%d %H:%M:%S')
+
+        # Format columns for better display
+        display_columns = [
+            {"name": "Device", "id": "device_serial"},
+            {"name": "Topic", "id": "topic"},
+            {"name": "Battery (%)", "id": "battery"},
+            {"name": "Connection", "id": "connection"},
+            {"name": "Defibrillator", "id": "defibrillator"},
+            {"name": "Latitude", "id": "latitude"},
+            {"name": "Longitude", "id": "longitude"},
+            {"name": "Power Source", "id": "power_source"},
+            {"name": "LED Power", "id": "led_power"},
+            {"name": "LED Defibrillator", "id": "led_defibrillator"},
+            {"name": "LED Monitoring", "id": "led_monitoring"},
+            {"name": "LED Assistance", "id": "led_assistance"},
+            {"name": "LED MQTT", "id": "led_mqtt"},
+            {"name": "LED Environmental", "id": "led_environmental"},
+            {"name": "Timestamp", "id": "created_at"}
+        ]
+
+        return dash_table.DataTable(
+            data=df.to_dict('records'),
+            columns=display_columns,
+            page_size=20,
+            sort_action="native",
+            filter_action="native",
+            style_table={'overflowX': 'auto'},
+            style_cell={
+                'textAlign': 'left',
+                'padding': '10px',
+                'fontSize': '12px'
+            },
+            style_header={
+                'backgroundColor': 'rgb(230, 230, 230)',
+                'fontWeight': 'bold'
+            },
+            style_data_conditional=[
+                {
+                    'if': {
+                        'filter_query': '{battery} < 20',
+                        'column_id': 'battery'
+                    },
+                    'backgroundColor': '#ffcccc',
+                    'color': 'black',
+                },
+                {
+                    'if': {
+                        'filter_query': '{led_defibrillator} = Red',
+                        'column_id': 'led_defibrillator'
+                    },
+                    'backgroundColor': '#ffcccc',
+                    'color': 'black',
+                },
+                {
+                    'if': {
+                        'filter_query': '{led_mqtt} = Red',
+                        'column_id': 'led_mqtt'
+                    },
+                    'backgroundColor': '#ffe6cc',
+                    'color': 'black',
+                }
+            ]
+        )
+    except Exception as e:
+        return html.P(f"Error loading device data: {str(e)}")
+
+def render_alerts_tab():
+    try:
+        # Get recent alerts
+        query = """
+        SELECT device_serial, alert_id, alert_message, timestamp,
+               CASE
+                   WHEN timestamp IS NOT NULL THEN to_timestamp(timestamp/1000.0)
+                   ELSE CURRENT_TIMESTAMP
+               END as created_at
+        FROM device_data
+        WHERE alert_id IS NOT NULL
+        AND CASE
+                WHEN timestamp IS NOT NULL THEN to_timestamp(timestamp/1000.0)
+                ELSE CURRENT_TIMESTAMP
+            END >= NOW() - INTERVAL '7 days'
+        ORDER BY CASE
+                   WHEN timestamp IS NOT NULL THEN to_timestamp(timestamp/1000.0)
+                   ELSE CURRENT_TIMESTAMP
+                 END DESC
+        """
+        df = db_manager.execute_query(query)
+
+        if df.empty:
+            return dbc.Row([
+                dbc.Col([
+                    dbc.Alert([
+                        html.I(className="bi bi-check-circle me-2"),
+                        "No recent alerts - All systems operating normally"
+                    ], color="success")
+                ])
+            ])
+
+        # Add alert description
+        df['alert_description'] = df['alert_id'].map(ALERT_CODES)
+        if 'created_at' in df.columns:
+            df['created_at'] = pd.to_datetime(df['created_at']).dt.strftime('%Y-%m-%d %H:%M:%S')
+
+        # Create alert frequency chart
+        alert_counts = df['alert_description'].value_counts()
+        fig_alerts = px.bar(
+            x=alert_counts.index,
+            y=alert_counts.values,
+            title='Alert Frequency (Last 7 Days)',
+            labels={'x': 'Alert Type', 'y': 'Count'},
+            color=alert_counts.values,
+            color_continuous_scale='Reds'
+        )
+        fig_alerts.update_layout(height=400, showlegend=False)
+        fig_alerts.update_xaxes(tickangle=45)
+
+        # Alert severity distribution
+        critical_alerts = [7, 5, 6]  # Defibrillator fault, Power cut, Critical temperature
+        df['severity'] = df['alert_id'].apply(lambda x: 'Critical' if x in critical_alerts else 'Warning')
+        severity_counts = df['severity'].value_counts()
+
+        fig_severity = px.pie(
+            values=severity_counts.values,
+            names=severity_counts.index,
+            title='Alert Severity Distribution',
+            color_discrete_map={'Critical': 'red', 'Warning': 'orange'}
+        )
+        fig_severity.update_layout(height=300)
+
+        return dbc.Row([
+            dbc.Col([
+                dcc.Graph(figure=fig_alerts)
+            ], width=8),
+            dbc.Col([
+                dcc.Graph(figure=fig_severity)
+            ], width=4),
+            dbc.Col([
+                html.H4([
+                    html.I(className="bi bi-exclamation-triangle me-2"),
+                    "Recent Alerts"
+                ]),
+                dash_table.DataTable(
+                    data=df.to_dict('records'),
+                    columns=[
+                        {"name": "Device", "id": "device_serial"},
+                        {"name": "Alert ID", "id": "alert_id"},
+                        {"name": "Description", "id": "alert_description"},
+                        {"name": "Message", "id": "alert_message"},
+                        {"name": "Severity", "id": "severity"},
+                        {"name": "Timestamp", "id": "created_at"}
+                    ],
+                    page_size=15,
+                    sort_action="native",
+                    style_cell={'textAlign': 'left', 'padding': '10px', 'fontSize': '12px'},
+                    style_header={'backgroundColor': 'rgb(230, 230, 230)', 'fontWeight': 'bold'},
+                    style_data_conditional=[
+                        {
+                            'if': {'filter_query': '{severity} = Critical'},
+                            'backgroundColor': '#ffcccc',
+                            'color': 'black'
+                        },
+                        {
+                            'if': {'filter_query': '{severity} = Warning'},
+                            'backgroundColor': '#ffe6cc',
+                            'color': 'black'
+                        }
+                    ]
+                )
+            ], width=12)
+        ])
+    except Exception as e:
+        return html.P(f"Error loading alerts: {str(e)}")
+
+def render_commands_tab():
+    try:
+        # Get recent commands and results
+        query = """
+        SELECT c.device_serial, c.operation_id, c.topic, c.created_at as command_time,
+               r.result_status, r.result_message, r.created_at as result_time
+        FROM Commands c
+        LEFT JOIN Results r ON c.command_id = r.command_id
+        WHERE c.created_at >= NOW() - INTERVAL '24 hours'
+        ORDER BY c.created_at DESC
+        LIMIT 50
+        """
+        df = db_manager.execute_query(query)
+
+        if df.empty:
+            return dbc.Row([
+                dbc.Col([
+                    dbc.Alert([
+                        html.I(className="bi bi-info-circle me-2"),
+                        "No recent commands executed"
+                    ], color="info")
+                ])
+            ])
+
+        # Format timestamps
+        if 'command_time' in df.columns:
+            df['command_time'] = pd.to_datetime(df['command_time']).dt.strftime('%Y-%m-%d %H:%M:%S')
+        if 'result_time' in df.columns:
+            df['result_time'] = pd.to_datetime(df['result_time']).dt.strftime('%Y-%m-%d %H:%M:%S')
+
+        # Command success rate
+        success_rate = len(df[df['result_status'] == '0']) / len(df[df['result_status'].notna()]) * 100 if len(df[df['result_status'].notna()]) > 0 else 0
+
+        # Command type distribution
+        df['command_type'] = df['topic'].str.split('/').str[-1]
+        command_counts = df['command_type'].value_counts()
+
+        fig_commands = px.bar(
+            x=command_counts.index,
+            y=command_counts.values,
+            title='Command Type Distribution (Last 24 Hours)',
+            labels={'x': 'Command Type', 'y': 'Count'}
+        )
+        fig_commands.update_layout(height=300)
+
+        return dbc.Row([
+            dbc.Col([
+                dbc.Card([
+                    dbc.CardBody([
+                        html.H4([
+                            html.I(className="bi bi-graph-up me-2"),
+                            "Command Statistics"
+                        ]),
+                        html.P(f"Total Commands: {len(df)}"),
+                        html.P(f"Success Rate: {success_rate:.1f}%"),
+                        html.P(f"Pending Results: {len(df[df['result_status'].isna()])}")
+                    ])
+                ])
+            ], width=4),
+            dbc.Col([
+                dcc.Graph(figure=fig_commands)
+            ], width=8),
+            dbc.Col([
+                html.H4([
+                    html.I(className="bi bi-terminal me-2"),
+                    "Recent Commands & Results"
+                ]),
+                dash_table.DataTable(
+                    data=df.to_dict('records'),
+                    columns=[
+                        {"name": "Device", "id": "device_serial"},
+                        {"name": "Operation", "id": "operation_id"},
+                        {"name": "Command Time", "id": "command_time"},
+                        {"name": "Result Status", "id": "result_status"},
+                        {"name": "Result Message", "id": "result_message"},
+                        {"name": "Result Time", "id": "result_time"}
+                    ],
+                    page_size=20,
+                    sort_action="native",
+                    style_cell={'textAlign': 'left', 'padding': '10px', 'fontSize': '12px'},
+                    style_header={'backgroundColor': 'rgb(230, 230, 230)', 'fontWeight': 'bold'},
+                    style_data_conditional=[
+                        {
+                            'if': {'filter_query': '{result_status} != 0 && {result_status} != null'},
+                            'backgroundColor': '#ffcccc',
+                        },
+                        {
+                            'if': {'filter_query': '{result_status} = null'},
+                            'backgroundColor': '#fff3cd',
+                        }
+                    ]
+                )
+            ], width=12)
+        ])
+    except Exception as e:
+        return html.P(f"Error loading commands: {str(e)}")
+
+def render_config_tab():
+    return dbc.Row([
+        dbc.Col([
+            dbc.Card([
+                dbc.CardHeader([
+                    html.I(className="bi bi-sliders me-2"),
+                    "Device Configuration Management"
+                ]),
+                dbc.CardBody([
+                    dbc.Row([
+                        dbc.Col([
+                            dbc.Label("Device Serial:"),
+                            dcc.Dropdown(id="config-device-selector", placeholder="Select device...")
+                        ], width=6),
+                        dbc.Col([
+                            dbc.Label("Configuration Template:"),
+                            dcc.Dropdown(
+                                id="config-template",
+                                options=[
+                                    {"label": "Standard Configuration", "value": "standard"},
+                                    {"label": "High Performance", "value": "high_performance"},
+                                    {"label": "Power Saving", "value": "power_saving"},
+                                    {"label": "Custom", "value": "custom"}
+                                ],
+                                placeholder="Select template..."
+                            )
+                        ], width=6)
+                    ]),
+                    html.Hr(),
+                    dbc.Row([
+                        dbc.Col([
+                            html.H5("Service Configuration"),
+                            dbc.Label("Monitoring Service:"),
+                            dbc.Switch(id="monitoring-switch", value=True, className="mb-3"),
+                            dbc.Label("Assistance Service:"),
+                            dbc.Switch(id="assistance-switch", value=True, className="mb-3")
+                        ], width=6),
+                        dbc.Col([
+                            html.H5("System Settings"),
+                            dbc.Label("Firmware Version:"),
+                            dbc.Input(id="firmware-version", placeholder="e.g., 1.2.3", className="mb-3"),
+                            dbc.Label("Audio Message:"),
+                            dcc.Dropdown(
+                                id="audio-message",
+                                options=[
+                                    {"label": "Message 1", "value": "message_1"},
+                                    {"label": "Message 2", "value": "message_2"}
+                                ],
+                                placeholder="Select audio message...",
+                                className="mb-3"
+                            )
+                        ], width=6)
+                    ]),
+                    html.Hr(),
+                    dbc.Row([
+                        dbc.Col([
+                            dbc.Button([
+                                html.I(className="bi bi-gear me-1"),
+                                "Update Config"
+                            ], id="update-config-btn", color="primary", className="me-2"),
+                            dbc.Button([
+                                html.I(className="bi bi-download me-1"),
+                                "Update Firmware"
+                            ], id="update-firmware-btn", color="warning", className="me-2"),
+                            dbc.Button([
+                                html.I(className="bi bi-volume-up me-1"),
+                                "Play Audio"
+                            ], id="play-audio-btn", color="info", className="me-2"),
+                            dbc.Button([
+                                html.I(className="bi bi-arrow-clockwise me-1"),
+                                "Get Current Config"
+                            ], id="get-config-btn", color="secondary")
+                        ])
+                    ]),
+                    html.Div(id="config-response", className="mt-3")
+                ])
+            ])
+        ], width=12)
+    ])
+
+def render_locations_tab(locations_data):
+    if not locations_data:
+        return dbc.Row([
+            dbc.Col([
+                dbc.Alert([
+                    html.I(className="bi bi-geo-alt me-2"),
+                    "No location data available. Click 'Get All Locations' to refresh."
+                ], color="warning")
+            ])
+        ])
+
+    df = pd.DataFrame(locations_data)
+
+    # Create map visualization
+    if not df.empty and 'latitude' in df.columns and 'longitude' in df.columns:
+        fig_map = px.scatter_mapbox(
+            df,
+            lat="latitude",
+            lon="longitude",
+            color="device_serial",
+            hover_name="device_serial",
+            hover_data=["location_time"],
+            title="Device Locations",
+            zoom=10
+        )
+        fig_map.update_layout(
+            mapbox_style="open-street-map",
+            height=500,
+            margin={"r":0,"t":30,"l":0,"b":0}
+        )
+
+        # Location history table
+        display_df = df.copy()
+        if 'location_time' in display_df.columns:
+            display_df['location_time'] = pd.to_datetime(display_df['location_time']).dt.strftime('%Y-%m-%d %H:%M:%S')
+
+        return dbc.Row([
+            dbc.Col([
+                dcc.Graph(figure=fig_map)
+            ], width=12),
+            dbc.Col([
+                html.H4([
+                    html.I(className="bi bi-table me-2"),
+                    "Location History"
+                ]),
+                dash_table.DataTable(
+                    data=display_df.to_dict('records'),
+                    columns=[
+                        {"name": "Device", "id": "device_serial"},
+                        {"name": "Latitude", "id": "latitude", "type": "numeric", "format": {"specifier": ".6f"}},
+                        {"name": "Longitude", "id": "longitude", "type": "numeric", "format": {"specifier": ".6f"}},
+                        {"name": "Location Time", "id": "location_time"}
+                    ],
+                    page_size=15,
+                    sort_action="native",
+                    style_cell={'textAlign': 'left', 'padding': '10px', 'fontSize': '12px'},
+                    style_header={'backgroundColor': 'rgb(230, 230, 230)', 'fontWeight': 'bold'}
+                )
+            ], width=12)
+        ])
+    else:
+        return dbc.Row([
+            dbc.Col([
+                dbc.Alert([
+                    html.I(className="bi bi-exclamation-triangle me-2"),
+                    "Location data is incomplete or invalid."
+                ], color="warning")
+            ])
+        ])
+
+def render_services_tab(services_data):
+    if not services_data:
+        return dbc.Row([
+            dbc.Col([
+                dbc.Alert([
+                    html.I(className="bi bi-info-circle me-2"),
+                    "No service data available. Click 'Check Services' to refresh."
+                ], color="info")
+            ])
+        ])
+
+    df = pd.DataFrame(services_data)
+
+    # Service status distribution
+    monitoring_counts = df['monitoring'].value_counts()
+    assistance_counts = df['assistance'].value_counts()
+
+    fig_monitoring = px.pie(
+        values=monitoring_counts.values,
+        names=monitoring_counts.index,
+        title='Monitoring Service Status',
+        color_discrete_map={'true': 'green', 'false': 'red', 'Unknown': 'gray'}
+    )
+    fig_monitoring.update_layout(height=300)
+
+    fig_assistance = px.pie(
+        values=assistance_counts.values,
+        names=assistance_counts.index,
+        title='Assistance Service Status',
+        color_discrete_map={'true': 'green', 'false': 'red', 'Unknown': 'gray'}
+    )
+    fig_assistance.update_layout(height=300)
+
+    # Format last updated time
+    display_df = df.copy()
+    if 'last_updated' in display_df.columns:
+        display_df['last_updated'] = pd.to_datetime(display_df['last_updated']).dt.strftime('%Y-%m-%d %H:%M:%S')
+
+    return dbc.Row([
+        dbc.Col([
+            dcc.Graph(figure=fig_monitoring)
+        ], width=6),
+        dbc.Col([
+            dcc.Graph(figure=fig_assistance)
+        ], width=6),
+        dbc.Col([
+            html.H4([
+                html.I(className="bi bi-list-check me-2"),
+                "Service Status by Device"
+            ]),
+            dash_table.DataTable(
+                data=display_df.to_dict('records'),
+                columns=[
+                    {"name": "Device", "id": "device_serial"},
+                    {"name": "Monitoring", "id": "monitoring"},
+                    {"name": "Assistance", "id": "assistance"},
+                    {"name": "Last Updated", "id": "last_updated"}
+                ],
+                page_size=15,
+                sort_action="native",
+                style_cell={'textAlign': 'left', 'padding': '10px', 'fontSize': '12px'},
+                style_header={'backgroundColor': 'rgb(230, 230, 230)', 'fontWeight': 'bold'},
+                style_data_conditional=[
+                    {
+                        'if': {
+                            'filter_query': '{monitoring} = false',
+                            'column_id': 'monitoring'
+                        },
+                        'backgroundColor': '#ffcccc',
+                        'color': 'black',
+                    },
+                    {
+                        'if': {
+                            'filter_query': '{assistance} = false',
+                            'column_id': 'assistance'
+                        },
+                        'backgroundColor': '#ffcccc',
+                        'color': 'black',
+                    },
+                    {
+                        'if': {
+                            'filter_query': '{monitoring} = Unknown || {assistance} = Unknown'
+                        },
+                        'backgroundColor': '#f8f9fa',
+                        'color': 'gray',
+                    }
+                ]
+            )
+        ], width=12)
+    ])
+
+def render_analytics_tab():
+    try:
+        # Get historical data for analytics
+        query = """
+        SELECT device_serial, battery, timestamp,
+               CASE
+                   WHEN timestamp IS NOT NULL THEN to_timestamp(timestamp/1000.0)
+                   ELSE CURRENT_TIMESTAMP
+               END as created_at,
+               EXTRACT(hour FROM
+                   CASE
+                       WHEN timestamp IS NOT NULL THEN to_timestamp(timestamp/1000.0)
+                       ELSE CURRENT_TIMESTAMP
+                   END
+               ) as hour_of_day,
+               EXTRACT(dow FROM
+                   CASE
+                       WHEN timestamp IS NOT NULL THEN to_timestamp(timestamp/1000.0)
+                       ELSE CURRENT_TIMESTAMP
+                   END
+               ) as day_of_week
+        FROM device_data
+        WHERE battery IS NOT NULL
+        AND CASE
+                WHEN timestamp IS NOT NULL THEN to_timestamp(timestamp/1000.0)
+                ELSE CURRENT_TIMESTAMP
+            END >= NOW() - INTERVAL '7 days'
+        ORDER BY CASE
+                   WHEN timestamp IS NOT NULL THEN to_timestamp(timestamp/1000.0)
+                   ELSE CURRENT_TIMESTAMP
+                 END
+        """
+        df = db_manager.execute_query(query)
+
+        if df.empty:
+            return html.P("No data available for analytics")
+
+        # Battery trends over time
+        df_battery_trend = df.groupby(['device_serial', 'created_at'])['battery'].mean().reset_index()
+        fig_battery_trend = px.line(
+            df_battery_trend,
+            x='created_at',
+            y='battery',
+            color='device_serial',
+            title='Battery Level Trends (Last 7 Days)',
+            labels={'created_at': 'Time', 'battery': 'Battery Level (%)'}
+        )
+        fig_battery_trend.update_layout(height=400)
+
+        # Average battery by hour of day
+        hourly_battery = df.groupby('hour_of_day')['battery'].mean().reset_index()
+        fig_hourly = px.bar(
+            hourly_battery,
+            x='hour_of_day',
+            y='battery',
+            title='Average Battery Level by Hour of Day',
+            labels={'hour_of_day': 'Hour of Day', 'battery': 'Average Battery Level (%)'}
+        )
+        fig_hourly.update_layout(height=400)
+
+        # Battery level distribution
+        fig_battery_dist = px.histogram(
+            df,
+            x='battery',
+            nbins=20,
+            title='Battery Level Distribution',
+            labels={'battery': 'Battery Level (%)', 'count': 'Frequency'}
+        )
+        fig_battery_dist.update_layout(height=300)
+
+        # Day of week analysis
+        day_names = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday']
+        weekly_battery = df.groupby('day_of_week')['battery'].mean().reset_index()
+        weekly_battery['day_name'] = weekly_battery['day_of_week'].map(lambda x: day_names[int(x)])
+
+        fig_weekly = px.bar(
+            weekly_battery,
+            x='day_name',
+            y='battery',
+            title='Average Battery Level by Day of Week',
+            labels={'day_name': 'Day of Week', 'battery': 'Average Battery Level (%)'}
+        )
+        fig_weekly.update_layout(height=300)
+
+        return dbc.Row([
+            dbc.Col([
+                dcc.Graph(figure=fig_battery_trend)
+            ], width=12),
+            dbc.Col([
+                dcc.Graph(figure=fig_hourly)
+            ], width=6),
+            dbc.Col([
+                dcc.Graph(figure=fig_weekly)
+            ], width=6),
+            dbc.Col([
+                dcc.Graph(figure=fig_battery_dist)
+            ], width=6),
+            dbc.Col([
+                html.H5("Analytics Summary"),
+                html.Div([
+                    html.P(f"Data Points Analyzed: {len(df):,}"),
+                    html.P(f"Average Battery Level: {df['battery'].mean():.1f}%"),
+                    html.P(f"Lowest Battery Reading: {df['battery'].min():.1f}%"),
+                    html.P(f"Highest Battery Reading: {df['battery'].max():.1f}%"),
+                    html.P(f"Devices Monitored: {df['device_serial'].nunique()}"),
+                    html.P(f"Time Range: {df['created_at'].min().strftime('%Y-%m-%d')} to {df['created_at'].max().strftime('%Y-%m-%d')}")
+                ])
+            ], width=6)
+        ])
+    except Exception as e:
+        return html.P(f"Error loading analytics: {str(e)}")
+
+# Command execution callbacks
+@app.callback(
+    Output('command-response', 'children'),
+    [Input('execute-btn', 'n_clicks')],
+    [State('device-selector', 'value'),
+     State('command-type', 'value')]
+)
+def execute_command(n_clicks, device_serial, command_type):
+    if not n_clicks or not device_serial or not command_type:
+        return ""
+
+    try:
+        op_id = str(uuid.uuid4())
+        payload = {"opId": op_id}
+
+        success = mqtt_publisher.publish_command(device_serial, command_type, payload)
+
+        if success:
+            return dbc.Alert([
+                html.I(className="bi bi-check-circle me-2"),
+                f"Command '{command_type}' sent to device {device_serial} with opId {op_id}"
+            ], color="success", dismissable=True)
+        else:
+            return dbc.Alert([
+                html.I(className="bi bi-x-circle me-2"),
+                f"Failed to send command '{command_type}' to device {device_serial}"
+            ], color="danger", dismissable=True)
+
+    except Exception as e:
+        return dbc.Alert([
+            html.I(className="bi bi-exclamation-triangle me-2"),
+            f"Error executing command: {str(e)}"
+        ], color="danger", dismissable=True)
+
+# Configuration callbacks
+@app.callback(
+    Output('config-device-selector', 'options'),
+    Input('interval-component', 'n_intervals')
+)
+def update_config_device_list(n):
+    try:
+        df = db_manager.execute_query("SELECT DISTINCT serial FROM Devices ORDER BY serial")
+        return [{"label": serial, "value": serial} for serial in df['serial']]
+    except:
+        return []
+
+@app.callback(
+    Output('config-response', 'children'),
+    [Input('update-config-btn', 'n_clicks'),
+     Input('update-firmware-btn', 'n_clicks'),
+     Input('play-audio-btn', 'n_clicks'),
+     Input('get-config-btn', 'n_clicks')],
+    [State('config-device-selector', 'value'),
+     State('monitoring-switch', 'value'),
+     State('assistance-switch', 'value'),
+     State('firmware-version', 'value'),
+     State('audio-message', 'value')]
+)
+def handle_config_actions(config_clicks, firmware_clicks, audio_clicks, get_config_clicks,
+                         device_serial, monitoring, assistance, firmware_version, audio_message):
+    if not device_serial:
+        return ""
+
+    ctx = callback_context
+    if not ctx.triggered:
+        return ""
+
+    button_id = ctx.triggered[0]['prop_id'].split('.')[0]
+
+    try:
+        if button_id == 'update-config-btn' and config_clicks:
+            config_data = {
+                "services": {
+                    "monitoring": str(monitoring).lower(),
+                    "assistance": str(assistance).lower()
+                }
+            }
+            success = mqtt_publisher.set_config(device_serial, config_data)
+
+            if success:
+                return dbc.Alert([
+                    html.I(className="bi bi-check-circle me-2"),
+                    "Configuration update sent successfully!"
+                ], color="success", dismissable=True)
+            else:
+                return dbc.Alert([
+                    html.I(className="bi bi-x-circle me-2"),
+                    "Failed to send configuration update!"
+                ], color="danger", dismissable=True)
+
+        elif button_id == 'update-firmware-btn' and firmware_clicks and firmware_version:
+            success = mqtt_publisher.update_firmware(device_serial, firmware_version)
+
+            if success:
+                return dbc.Alert([
+                    html.I(className="bi bi-download me-2"),
+                    f"Firmware update to version {firmware_version} initiated!"
+                ], color="warning", dismissable=True)
+            else:
+                return dbc.Alert([
+                    html.I(className="bi bi-x-circle me-2"),
+                    "Failed to send firmware update command!"
+                ], color="danger", dismissable=True)
+
+        elif button_id == 'play-audio-btn' and audio_clicks and audio_message:
+            success = mqtt_publisher.play_audio(device_serial, audio_message)
+
+            if success:
+                return dbc.Alert([
+                    html.I(className="bi bi-volume-up me-2"),
+                    f"Audio message '{audio_message}' sent to device!"
+                ], color="info", dismissable=True)
+            else:
+                return dbc.Alert([
+                    html.I(className="bi bi-x-circle me-2"),
+                    "Failed to send audio command!"
+                ], color="danger", dismissable=True)
+
+        elif button_id == 'get-config-btn' and get_config_clicks:
+            success = mqtt_publisher.request_config(device_serial)
+
+            if success:
+                return dbc.Alert([
+                    html.I(className="bi bi-arrow-clockwise me-2"),
+                    "Configuration request sent! Check the Commands tab for results."
+                ], color="secondary", dismissable=True)
+            else:
+                return dbc.Alert([
+                    html.I(className="bi bi-x-circle me-2"),
+                    "Failed to send configuration request!"
+                ], color="danger", dismissable=True)
+
+    except Exception as e:
+        return dbc.Alert([
+            html.I(className="bi bi-exclamation-triangle me-2"),
+            f"Error: {str(e)}"
+        ], color="danger", dismissable=True)
+
+    return ""
+
+# Additional utility callbacks for enhanced functionality
+@app.callback(
+    Output('selected-device-store', 'data'),
+    Input('device-selector', 'value')
+)
+def store_selected_device(device_serial):
+    return device_serial
+
+# Callback for template configuration loading
+@app.callback(
+    [Output('monitoring-switch', 'value'),
+     Output('assistance-switch', 'value')],
+    [Input('config-template', 'value')],
+    prevent_initial_call=True
+)
+def load_config_template(template):
+    if template == "standard":
+        return True, True
+    elif template == "high_performance":
+        return True, True
+    elif template == "power_saving":
+        return False, False
+    else:  # custom
+        return True, True
+
+# Enhanced location request callback
+@app.callback(
+    Output('locations-store', 'data', allow_duplicate=True),
+    Input('get-locations-btn', 'n_clicks'),
+    prevent_initial_call=True
+)
+def request_and_update_locations(n_clicks):
+    if not n_clicks:
+        return dash.no_update
+
+    try:
+        # Get existing location data first
+        df = db_manager.get_device_locations()
+        return df.to_dict('records')
+    except Exception as e:
+        logger.error(f"Error getting locations: {e}")
+        return []
+
+# Enhanced service checking callback
+@app.callback(
+    Output('services-store', 'data', allow_duplicate=True),
+    Input('check-services-btn', 'n_clicks'),
+    prevent_initial_call=True
+)
+def check_and_update_services(n_clicks):
+    if not n_clicks:
+        return dash.no_update
+
+    try:
+        # Get all devices
+        devices_df = db_manager.execute_query("SELECT DISTINCT serial FROM Devices")
+        services_data = []
+
+        for _, row in devices_df.iterrows():
+            device_serial = row['serial']
+            service_df = db_manager.get_service_status(device_serial)
+
+            if not service_df.empty:
+                services_data.append({
+                    'device_serial': device_serial,
+                    'monitoring': service_df.iloc[0]['monitoring'],
+                    'assistance': service_df.iloc[0]['assistance'],
+                    'last_updated': service_df.iloc[0]['created_at']
+                })
+            else:
+                services_data.append({
+                    'device_serial': device_serial,
+                    'monitoring': 'Unknown',
+                    'assistance': 'Unknown',
+                    'last_updated': None
+                })
+
+        return services_data
+    except Exception as e:
+        logger.error(f"Error getting services data: {e}")
+        return []
+
+# Real-time alerts callback
+@app.callback(
+    Output('alert-banner', 'children', allow_duplicate=True),
+    Input('show-alerts-btn', 'n_clicks'),
+    prevent_initial_call=True
+)
+def show_recent_alerts(n_clicks):
+    if not n_clicks:
+        return None
+
+    try:
+        # Get recent critical alerts (last hour)
+        query = """
+        SELECT device_serial, alert_id, alert_message,
+               CASE
+                   WHEN timestamp IS NOT NULL THEN to_timestamp(timestamp/1000.0)
+                   ELSE created_at
+               END as alert_time
+        FROM device_data
+        WHERE alert_id IN (5, 6, 7)  -- Critical alerts: Power cut, Critical temp, Defibrillator fault
+        AND CASE
+                WHEN timestamp IS NOT NULL THEN to_timestamp(timestamp/1000.0)
+                ELSE created_at
+            END >= NOW() - INTERVAL '1 hour'
+        ORDER BY alert_time DESC
+        LIMIT 5
+        """
+        df = db_manager.execute_query(query)
+
+        if df.empty:
+            return dbc.Alert([
+                html.I(className="bi bi-check-circle me-2"),
+                "No critical alerts in the last hour"
+            ], color="success", dismissable=True)
+
+        alert_items = []
+        for _, alert in df.iterrows():
+            alert_desc = ALERT_CODES.get(alert['alert_id'], f"Unknown alert {alert['alert_id']}")
+            alert_time = pd.to_datetime(alert['alert_time']).strftime('%H:%M:%S')
+            alert_items.append(
+                html.Li(f"{alert['device_serial']}: {alert_desc} at {alert_time}")
+            )
+
+        return dbc.Alert([
+            html.H4([
+                html.I(className="bi bi-exclamation-triangle me-2"),
+                "Recent Critical Alerts"
+            ], className="alert-heading"),
+            html.Ul(alert_items)
+        ], color="danger", dismissable=True)
+
+    except Exception as e:
+        return dbc.Alert([
+            html.I(className="bi bi-x-circle me-2"),
+            f"Error loading alerts: {str(e)}"
+        ], color="danger", dismissable=True)
+
+# Additional helper functions for enhanced functionality
+def get_device_summary():
+    """Get a summary of all devices and their current status"""
+    try:
+        query = """
+        SELECT
+            COUNT(DISTINCT device_serial) as total_devices,
+            COUNT(CASE WHEN battery < 20 THEN 1 END) as low_battery_devices,
+            COUNT(CASE WHEN led_mqtt = 'Red' THEN 1 END) as offline_devices,
+            COUNT(CASE WHEN led_defibrillator = 'Red' THEN 1 END) as defibrillator_issues,
+            AVG(battery) as avg_battery
+        FROM (
+            SELECT DISTINCT ON (device_serial)
+                device_serial, battery, led_mqtt, led_defibrillator
+            FROM device_data
+            WHERE created_at >= NOW() - INTERVAL '1 hour'
+            ORDER BY device_serial, created_at DESC
+        ) latest_data
+        """
+        return db_manager.execute_query(query)
+    except Exception as e:
+        logger.error(f"Error getting device summary: {e}")
+        return pd.DataFrame()
+
+def get_firmware_status():
+    """Get firmware version information for all devices"""
+    try:
+        query = """
+        SELECT
+            device_serial,
+            payload->>'version' as firmware_version,
+            created_at
+        FROM device_data
+        WHERE topic LIKE '%/event/version'
+        AND payload->>'version' IS NOT NULL
+        ORDER BY device_serial, created_at DESC
+        """
+        return db_manager.execute_query(query)
+    except Exception as e:
+        logger.error(f"Error getting firmware status: {e}")
+        return pd.DataFrame()
+
+# Enhanced error handling and logging
+def log_tab_changes(active_tab):
+    logger.info(f"User switched to tab: {active_tab}")
+    return None
+
+# Add a health check callback
+@app.callback(
+    Output('device-data-store', 'data', allow_duplicate=True),
+    Input('interval-component', 'n_intervals'),
+    prevent_initial_call=True
+)
+def health_check(n_intervals):
+    """Perform periodic health checks every 5 minutes"""
+    if n_intervals % 10 == 0:  # Every 10th interval (5 minutes with 30s intervals)
+        try:
+            # Check database connectivity
+            test_query = "SELECT 1"
+            db_manager.execute_query(test_query)
+
+            # Check MQTT connectivity
+            if not mqtt_publisher.client or not mqtt_publisher.client.is_connected():
+                logger.warning("MQTT client is not connected - attempting reconnection")
+                mqtt_publisher.connect()
+
+            logger.info(f"Health check completed at interval {n_intervals}")
+
+        except Exception as e:
+            logger.error(f"Health check failed: {e}")
+
+    return dash.no_update
+
+if __name__ == '__main__':
+    try:
+        logger.info("Starting LOCACOEUR MQTT Dashboard...")
+        app.run(debug=True, host='0.0.0.0', port=8050)
+    except Exception as e:
+        logger.error(f"Failed to start dashboard: {e}")
+        raise

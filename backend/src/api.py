@@ -1,3 +1,4 @@
+ubuntu@vps-d4be9002:/opt/locacoeur-monitor/backend/src$ cat api.py
 from fastapi import FastAPI
 import psycopg2
 from decouple import config
@@ -24,8 +25,8 @@ async def get_devices():
                 SELECT MAX(received_at) FROM device_data WHERE device_serial = d.serial
             )
         """)
-        return [{"serial": row[0], "battery": row[1], "led_power": row[2], 
-                 "led_defibrillator": row[3], "latitude": row[4], "longitude": row[5]} 
+        return [{"serial": row[0], "battery": row[1], "led_power": row[2],
+                 "led_defibrillator": row[3], "latitude": row[4], "longitude": row[5]}
                 for row in cur.fetchall()]
 
 @app.get("/alerts")
@@ -39,5 +40,5 @@ async def get_alerts():
             ORDER BY received_at DESC
             LIMIT 50
         """)
-        return [{"device_serial": row[0], "alert_id": row[1], "alert_message": row[2], 
+        return [{"device_serial": row[0], "alert_id": row[1], "alert_message": row[2],
                  "received_at": row[3].isoformat()} for row in cur.fetchall()]
