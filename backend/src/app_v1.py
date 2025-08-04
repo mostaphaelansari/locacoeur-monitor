@@ -578,9 +578,6 @@ def update_device_list(n):
         logger.error(f"Error updating device list: {e}")
         return []
 
-# Correction pour gui.py - Fonction update_device_data ligne 314
-# Remplacer la fonction existante par cette version corrigée
-
 @app.callback(
     [Output('device-data-store', 'data'),
      Output('alert-banner', 'children')],
@@ -597,20 +594,8 @@ def update_device_data(n_intervals, refresh_clicks):
         critical_devices = []
 
         for _, device in df.iterrows():
-            # FIX: Gestion robuste des valeurs NULL pour battery
-            battery_value = device.get('battery')
-            
-            # Convertir en numérique et gérer les valeurs NULL/invalides
-            try:
-                battery = float(battery_value) if battery_value is not None else 100
-            except (ValueError, TypeError):
-                battery = 100  # Valeur par défaut si conversion impossible
-            
-            # Vérifier batterie faible (seulement si valeur valide)
-            if battery_value is not None and battery < 20:
-                critical_devices.append(f"{device['device_serial']} (Battery: {battery:.0f}%)")
-            
-            # Vérifier problème défibrillateur
+            if device.get('battery', 100) < 20:
+                critical_devices.append(f"{device['device_serial']} (Battery: {device.get('battery', 0)}%)")
             if device.get('led_defibrillator') == 'Red':
                 critical_devices.append(f"{device['device_serial']} (Defibrillator Issue)")
 
@@ -689,129 +674,98 @@ def update_status_cards(device_data):
 
     cards = []
     for device in device_data:
-        try:
-            # LED status indicators
-            led_indicators = []
-            led_types = ['power', 'defibrillator', 'monitoring', 'assistance', 'mqtt', 'environmental']
+        # LED status indicators
+        led_indicators = []
+        led_types = ['power', 'defibrillator', 'monitoring', 'assistance', 'mqtt', 'environmental']
 
-            for led_type in led_types:
-                led_key = f'led_{led_type}'
-                status = device.get(led_key, 'Off')
-                if status == 'Green':
-                    color, icon = 'success', 'bi-check-circle-fill'
-                elif status == 'Red':
-                    color, icon = 'danger', 'bi-x-circle-fill'
-                else:
-                    color, icon = 'secondary', 'bi-circle'
+        for led_type in led_types:
+            led_key = f'led_{led_type}'
+            status = device.get(led_key, 'Off')
+            if status == 'Green':
+                color, icon = 'success', 'bi-check-circle-fill'
+            elif status == 'Red':
+                color, icon = 'danger', 'bi-x-circle-fill'
+            else:
+                color, icon = 'secondary', 'bi-circle'
 
-                led_indicators.append(
-                    dbc.Badge([
-                        html.I(className=f"bi {icon} me-1"),
-                        f"{led_type.title()}: {status}"
-                    ], color=color, className="me-1 mb-1")
-                )
+            led_indicators.append(
+                dbc.Badge([
+                    html.I(className=f"bi {icon} me-1"),
+                    f"{led_type.title()}: {status}"
+                ], color=color, className="me-1 mb-1")
+            )
 
-            # FIX: Battery level color and icon avec gestion NULL
-            battery_raw = device.get('battery')
-            
-            # Conversion robuste avec gestion des valeurs NULL
+        # Battery level color and icon
+        battery = device.get('battery', 0)
+        if battery is None:
+            battery = 0
+        if battery < 20:
+            battery_color, battery_icon = 'danger', 'bi-battery'
+        elif battery < 50:
+            battery_color, battery_icon = 'warning', 'bi-battery-half'
+        else:
+            battery_color, battery_icon = 'success', 'bi-battery-full'
+
+        # Last update time
+        last_update = device.get('created_at')
+        if last_update and pd.notna(last_update):
             try:
-                battery = float(battery_raw) if battery_raw is not None else 0
-            except (ValueError, TypeError):
-                battery = 0
-            
-            # Logique de couleur/icône selon batterie
-            if battery is None or battery == 0:
-                battery_color, battery_icon = 'secondary', 'bi-battery'
-                battery_display = "N/A"
-            elif battery < 20:
-                battery_color, battery_icon = 'danger', 'bi-battery'
-                battery_display = f"{battery:.0f}%"
-            elif battery < 50:
-                battery_color, battery_icon = 'warning', 'bi-battery-half'
-                battery_display = f"{battery:.0f}%"
-            else:
-                battery_color, battery_icon = 'success', 'bi-battery-full'
-                battery_display = f"{battery:.0f}%"
-
-            # Last update time
-            last_update = device.get('created_at')
-            if last_update and pd.notna(last_update):
-                try:
-                    last_update_str = pd.to_datetime(last_update).strftime('%Y-%m-%d %H:%M:%S')
-                except:
-                    last_update_str = 'Unknown'
-            else:
+                last_update_str = pd.to_datetime(last_update).strftime('%Y-%m-%d %H:%M:%S')
+            except:
                 last_update_str = 'Unknown'
+        else:
+            last_update_str = 'Unknown'
 
-            card = dbc.Card([
-                dbc.CardHeader([
-                    html.H5([
-                        html.I(className="bi bi-device-hdd me-2"),
-                        f"Device {device['device_serial']}"
-                    ], className="mb-0")
-                ]),
-                dbc.CardBody([
-                    dbc.Row([
-                        dbc.Col([
-                            html.P([
-                                html.I(className=f"bi {battery_icon} me-2"),
-                                html.Strong("Battery: "),
-                                dbc.Badge(battery_display, color=battery_color)
-                            ]),
-                            html.P([
-                                html.I(className="bi bi-wifi me-2"),
-                                html.Strong("Connection: "),
-                                device.get('connection', 'Unknown')
-                            ]),
-                            html.P([
-                                html.I(className="bi bi-power me-2"),
-                                html.Strong("Power Source: "),
-                                device.get('power_source', 'Unknown')
-                            ]),
-                            html.P([
-                                html.I(className="bi bi-heart-pulse me-2"),
-                                html.Strong("Defibrillator: "),
-                                device.get('defibrillator', 'Unknown')
-                            ])
-                        ], width=6),
-                        dbc.Col([
-                            html.P([
-                                html.I(className="bi bi-lightbulb me-2"),
-                                html.Strong("LED Status:")
-                            ], className="fw-bold"),
-                            html.Div(led_indicators),
-                            html.P([
-                                html.I(className="bi bi-clock me-2"),
-                                html.Strong("Last Update: "),
-                                html.Small(last_update_str)
-                            ], className="mt-2")
-                        ], width=6)
-                    ])
-                ])
-            ], className="mb-3")
-
-            cards.append(dbc.Col(card, width=12, lg=6, xl=4))
-            
-        except Exception as e:
-            logger.error(f"Error creating card for device {device.get('device_serial', 'Unknown')}: {e}")
-            # Créer une carte d'erreur au lieu d'ignorer
-            error_card = dbc.Col([
-                dbc.Card([
-                    dbc.CardBody([
-                        html.Div([
-                            html.I(className="bi bi-exclamation-triangle me-2", style={"color": "red"}),
-                            html.Strong(f"Error loading device {device.get('device_serial', 'Unknown')}"),
-                            html.Br(),
-                            html.Small(f"Error: {str(e)}", className="text-muted")
+        card = dbc.Card([
+            dbc.CardHeader([
+                html.H5([
+                    html.I(className="bi bi-device-hdd me-2"),
+                    f"Device {device['device_serial']}"
+                ], className="mb-0")
+            ]),
+            dbc.CardBody([
+                dbc.Row([
+                    dbc.Col([
+                        html.P([
+                            html.I(className=f"bi {battery_icon} me-2"),
+                            html.Strong("Battery: "),
+                            dbc.Badge(f"{battery}%", color=battery_color)
+                        ]),
+                        html.P([
+                            html.I(className="bi bi-wifi me-2"),
+                            html.Strong("Connection: "),
+                            device.get('connection', 'Unknown')
+                        ]),
+                        html.P([
+                            html.I(className="bi bi-power me-2"),
+                            html.Strong("Power Source: "),
+                            device.get('power_source', 'Unknown')
+                        ]),
+                        html.P([
+                            html.I(className="bi bi-heart-pulse me-2"),
+                            html.Strong("Defibrillator: "),
+                            device.get('defibrillator', 'Unknown')
                         ])
-                    ])
-                ], style={"border-left": "4px solid red"})
-            ], width=12, lg=6, xl=4, className="mb-3")
-            cards.append(error_card)
-            continue
+                    ], width=6),
+                    dbc.Col([
+                        html.P([
+                            html.I(className="bi bi-lightbulb me-2"),
+                            html.Strong("LED Status:")
+                        ], className="fw-bold"),
+                        html.Div(led_indicators),
+                        html.P([
+                            html.I(className="bi bi-clock me-2"),
+                            html.Strong("Last Update: "),
+                            html.Small(last_update_str)
+                        ], className="mt-2")
+                    ], width=6)
+                ])
+            ])
+        ], className="mb-3")
 
-    return dbc.Row(cards) if cards else html.P("No valid device data to display")
+        cards.append(dbc.Col(card, width=12, lg=6, xl=4))
+
+    return dbc.Row(cards)
 
 @app.callback(
     Output('tab-content', 'children'),
@@ -844,33 +798,20 @@ def render_monitoring_tab(device_data):
         return html.P("No device data available for monitoring")
 
     df = pd.DataFrame(device_data)
-    
-    # FIX: Nettoyage des données battery avant utilisation
-    if 'battery' in df.columns:
-        # Convertir les valeurs battery en numérique, remplacer NULL par NaN
-        df['battery'] = pd.to_numeric(df['battery'], errors='coerce')
-        # Filtrer les lignes avec des valeurs battery valides pour le graphique
-        df_battery_valid = df.dropna(subset=['battery'])
-    else:
-        df_battery_valid = pd.DataFrame()
 
-    # Create battery level chart (seulement avec valeurs valides)
-    if not df_battery_valid.empty:
-        fig_battery = px.bar(
-            df_battery_valid,
-            x='device_serial',
-            y='battery',
-            title='Battery Levels by Device',
-            color='battery',
-            color_continuous_scale=['red', 'yellow', 'green'],
-            labels={'device_serial': 'Device Serial', 'battery': 'Battery Level (%)'}
-        )
-        fig_battery.update_layout(height=400, showlegend=False)
-    else:
-        fig_battery = go.Figure()
-        fig_battery.update_layout(title="No valid battery data available", height=400)
+    # Create battery level chart
+    fig_battery = px.bar(
+        df,
+        x='device_serial',
+        y='battery',
+        title='Battery Levels by Device',
+        color='battery',
+        color_continuous_scale=['red', 'yellow', 'green'],
+        labels={'device_serial': 'Device Serial', 'battery': 'Battery Level (%)'}
+    )
+    fig_battery.update_layout(height=400, showlegend=False)
 
-    # Create LED status summary (reste inchangé)
+    # Create LED status summary
     led_cols = ['led_power', 'led_defibrillator', 'led_monitoring', 'led_assistance', 'led_mqtt', 'led_environmental']
     led_status_data = []
 
@@ -899,7 +840,7 @@ def render_monitoring_tab(device_data):
         fig_led = go.Figure()
         fig_led.update_layout(title="No LED data available", height=400)
 
-    # Device connectivity status (reste inchangé)
+    # Device connectivity status
     connection_counts = df['connection'].value_counts() if 'connection' in df.columns else pd.Series()
     if not connection_counts.empty:
         fig_connection = px.pie(
@@ -911,21 +852,6 @@ def render_monitoring_tab(device_data):
     else:
         fig_connection = go.Figure()
         fig_connection.update_layout(title="No connection data available", height=300)
-
-    # FIX: Statistiques avec gestion des valeurs NULL
-    total_devices = len(df)
-    
-    # Compter batterie faible (seulement valeurs valides)
-    low_battery_count = 0
-    if 'battery' in df.columns:
-        battery_valid = pd.to_numeric(df['battery'], errors='coerce')
-        low_battery_count = len(battery_valid[(battery_valid < 20) & (battery_valid.notna())])
-    
-    # Compter dispositifs offline
-    offline_count = len(df[df['led_mqtt'] == 'Red']) if 'led_mqtt' in df.columns else 0
-    
-    # Compter problèmes défibrillateur
-    defib_issues_count = len(df[df['led_defibrillator'] == 'Red']) if 'led_defibrillator' in df.columns else 0
 
     return dbc.Row([
         dbc.Col([
@@ -940,15 +866,15 @@ def render_monitoring_tab(device_data):
         dbc.Col([
             html.H5("System Status Summary"),
             html.Div([
-                dbc.Badge(f"Total Devices: {total_devices}", color="primary", className="me-2 mb-2"),
-                dbc.Badge(f"Low Battery: {low_battery_count}",
-                         color="danger" if low_battery_count > 0 else "success",
+                dbc.Badge(f"Total Devices: {len(df)}", color="primary", className="me-2 mb-2"),
+                dbc.Badge(f"Low Battery: {len(df[df['battery'] < 20]) if 'battery' in df.columns else 0}",
+                         color="danger" if ('battery' in df.columns and len(df[df['battery'] < 20]) > 0) else "success",
                          className="me-2 mb-2"),
-                dbc.Badge(f"Offline: {offline_count}",
-                         color="warning" if offline_count > 0 else "success",
+                dbc.Badge(f"Offline: {len(df[df['led_mqtt'] == 'Red']) if 'led_mqtt' in df.columns else 0}",
+                         color="warning" if ('led_mqtt' in df.columns and len(df[df['led_mqtt'] == 'Red']) > 0) else "success",
                          className="me-2 mb-2"),
-                dbc.Badge(f"Defibrillator Issues: {defib_issues_count}",
-                         color="danger" if defib_issues_count > 0 else "success",
+                dbc.Badge(f"Defibrillator Issues: {len(df[df['led_defibrillator'] == 'Red']) if 'led_defibrillator' in df.columns else 0}",
+                         color="danger" if ('led_defibrillator' in df.columns and len(df[df['led_defibrillator'] == 'Red']) > 0) else "success",
                          className="me-2 mb-2")
             ])
         ], width=6)
